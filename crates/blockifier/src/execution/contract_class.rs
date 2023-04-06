@@ -1,11 +1,11 @@
-use std::collections::HashMap;
-use std::fs::File;
-use std::io;
-use std::io::BufReader;
-use std::path::PathBuf;
+use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
-use starknet_api::state::{EntryPoint, EntryPointType, Program};
+use starknet_api::deprecated_contract_class::{
+    ContractClass as DeprecatedContractClass, EntryPoint, EntryPointType, Program,
+};
+
+use crate::collections::HashMap;
 
 /// Represents a StarkNet contract class.
 #[derive(Debug, Clone, Default, Eq, PartialEq, Deserialize, Serialize)]
@@ -17,7 +17,7 @@ pub struct ContractClass {
     pub abi: Option<serde_json::Value>,
 }
 
-impl From<ContractClass> for starknet_api::state::ContractClass {
+impl From<ContractClass> for DeprecatedContractClass {
     fn from(contract_class: ContractClass) -> Self {
         Self {
             program: contract_class.program,
@@ -28,26 +28,13 @@ impl From<ContractClass> for starknet_api::state::ContractClass {
     }
 }
 
-impl From<starknet_api::state::ContractClass> for ContractClass {
-    fn from(contract_class: starknet_api::state::ContractClass) -> Self {
+impl From<DeprecatedContractClass> for ContractClass {
+    fn from(contract_class: DeprecatedContractClass) -> Self {
         Self {
             program: contract_class.program,
             entry_points_by_type: contract_class.entry_points_by_type,
             // ABI is not used for execution.
             abi: None,
         }
-    }
-}
-
-/// Instantiates a contract class object given a compiled contract file path.
-impl TryFrom<PathBuf> for ContractClass {
-    type Error = io::Error;
-
-    fn try_from(path: PathBuf) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-
-        let raw_contract_class = serde_json::from_reader(reader)?;
-        Ok(raw_contract_class)
     }
 }

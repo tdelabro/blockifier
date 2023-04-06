@@ -1,7 +1,9 @@
-use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::any::Any;
 
-use cairo_felt::Felt;
+use cairo_felt::Felt252;
 use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_definition::{
     BuiltinHintProcessor, HintProcessorData,
 };
@@ -11,20 +13,22 @@ use cairo_vm::serde::deserialize_program::ApTracking;
 use cairo_vm::types::exec_scope::ExecutionScopes;
 use cairo_vm::types::relocatable::{MaybeRelocatable, Relocatable};
 use cairo_vm::vm::errors::hint_errors::HintError;
-use cairo_vm::vm::errors::vm_errors::VirtualMachineError;
 use cairo_vm::vm::vm_core::VirtualMachine;
-use starknet_api::core::{ContractAddress, EntryPointSelector};
+use starknet_api::api_core::{ContractAddress, EntryPointSelector};
 use starknet_api::hash::StarkFelt;
 use starknet_api::state::StorageKey;
 use starknet_api::transaction::Calldata;
 
 use crate::block_context::BlockContext;
+use crate::collections::{HashMap, HashSet};
 use crate::execution::common_hints::{extended_builtin_hint_processor, HintExecutionResult};
-use crate::execution::entry_point::{CallEntryPoint, CallInfo, OrderedEvent, OrderedL2ToL1Message};
+use crate::execution::entry_point::{
+    CallEntryPoint, CallInfo, ExecutionContext, ExecutionResources, OrderedEvent,
+    OrderedL2ToL1Message,
+};
 use crate::execution::errors::SyscallExecutionError;
 use crate::execution::execution_utils::{
-    felt_from_memory_ptr, felt_range_from_ptr, stark_felt_to_felt, ReadOnlySegment,
-    ReadOnlySegments,
+    felt_from_ptr, felt_range_from_ptr, stark_felt_to_felt, ReadOnlySegment, ReadOnlySegments,
 };
 use crate::execution::hint_code;
 use crate::execution::syscalls::{
@@ -37,11 +41,15 @@ use crate::execution::syscalls::{
 use crate::state::state_api::State;
 use crate::transaction::objects::AccountTransactionContext;
 
+pub type SyscallCounter = HashMap<SyscallSelector, usize>;
+
 /// Executes StarkNet syscalls (stateful protocol hints) during the execution of an entry point
 /// call.
 pub struct SyscallHintProcessor<'a> {
     // Input for execution.
     pub state: &'a mut dyn State,
+    pub execution_resources: &'a mut ExecutionResources,
+    pub execution_context: &'a mut ExecutionContext,
     pub block_context: &'a BlockContext,
     pub account_tx_context: &'a AccountTransactionContext,
     pub storage_address: ContractAddress,
@@ -60,10 +68,6 @@ pub struct SyscallHintProcessor<'a> {
     // Additional information gathered during execution.
     pub read_values: Vec<StarkFelt>,
     pub accessed_keys: HashSet<StorageKey>,
-    // Used for tracking events order during the current execution.
-    pub n_emitted_events: usize,
-    // Used for tracking L2-to-L1 messages order during the current execution.
-    pub n_sent_messages_to_l1: usize,
 
     // Additional fields.
     // Invariant: must only contain allowed hints.
@@ -71,12 +75,14 @@ pub struct SyscallHintProcessor<'a> {
     // Transaction info. and signature segments; allocated on-demand.
     tx_signature_start_ptr: Option<Relocatable>,
     tx_info_start_ptr: Option<Relocatable>,
-    syscall_counter: HashMap<SyscallSelector, usize>,
 }
 
 impl<'a> SyscallHintProcessor<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: &'a mut dyn State,
+        execution_resources: &'a mut ExecutionResources,
+        execution_context: &'a mut ExecutionContext,
         block_context: &'a BlockContext,
         account_tx_context: &'a AccountTransactionContext,
         initial_syscall_ptr: Relocatable,
@@ -85,6 +91,8 @@ impl<'a> SyscallHintProcessor<'a> {
     ) -> Self {
         SyscallHintProcessor {
             state,
+            execution_resources,
+            execution_context,
             block_context,
             account_tx_context,
             storage_address,
@@ -96,12 +104,9 @@ impl<'a> SyscallHintProcessor<'a> {
             syscall_ptr: initial_syscall_ptr,
             read_values: vec![],
             accessed_keys: HashSet::new(),
-            n_emitted_events: 0,
-            n_sent_messages_to_l1: 0,
             builtin_hint_processor: extended_builtin_hint_processor(),
             tx_signature_start_ptr: None,
             tx_info_start_ptr: None,
-            syscall_counter: HashMap::default(),
         }
     }
 
@@ -206,14 +211,14 @@ impl<'a> SyscallHintProcessor<'a> {
     }
 
     fn read_next_syscall_selector(&mut self, vm: &mut VirtualMachine) -> SyscallResult<StarkFelt> {
-        let selector = felt_from_memory_ptr(vm, self.syscall_ptr)?;
-        self.syscall_ptr = self.syscall_ptr + 1;
+        let selector = felt_from_ptr(vm, self.syscall_ptr)?;
+        self.syscall_ptr = (self.syscall_ptr + 1)?;
 
         Ok(selector)
     }
 
     fn increment_syscall_count(&mut self, selector: &SyscallSelector) {
-        let syscall_count = self.syscall_counter.entry(*selector).or_default();
+        let syscall_count = self.execution_resources.syscall_counter.entry(*selector).or_default();
         *syscall_count += 1;
     }
 
@@ -235,11 +240,11 @@ impl<'a> SyscallHintProcessor<'a> {
         let tx_info: Vec<MaybeRelocatable> = vec![
             stark_felt_to_felt(self.account_tx_context.version.0).into(),
             stark_felt_to_felt(*self.account_tx_context.sender_address.0.key()).into(),
-            Felt::from(self.account_tx_context.max_fee.0).into(),
+            Felt252::from(self.account_tx_context.max_fee.0).into(),
             tx_signature_length.into(),
             tx_signature_start_ptr.into(),
             stark_felt_to_felt(self.account_tx_context.transaction_hash.0).into(),
-            Felt::from_bytes_be(self.block_context.chain_id.0.as_bytes()).into(),
+            Felt252::from_bytes_be(self.block_context.chain_id.0.as_bytes()).into(),
             stark_felt_to_felt(self.account_tx_context.nonce.0).into(),
         ];
 
@@ -276,7 +281,7 @@ impl HintProcessor for SyscallHintProcessor<'_> {
         vm: &mut VirtualMachine,
         exec_scopes: &mut ExecutionScopes,
         hint_data: &Box<dyn Any>,
-        constants: &HashMap<String, Felt>,
+        constants: &HashMap<String, Felt252>,
     ) -> HintExecutionResult {
         let hint = hint_data.downcast_ref::<HintProcessorData>().ok_or(HintError::WrongHintData)?;
         if hint_code::SYSCALL_HINTS.contains(hint.code.as_str()) {
@@ -307,10 +312,10 @@ pub fn write_felt(vm: &mut VirtualMachine, ptr: Relocatable, felt: StarkFelt) ->
 }
 
 pub fn read_felt_array(vm: &VirtualMachine, ptr: Relocatable) -> SyscallResult<Vec<StarkFelt>> {
-    let array_size = felt_from_memory_ptr(vm, ptr)?;
-    let array_data_ptr = vm.get_maybe(&(ptr + 1)).ok_or(VirtualMachineError::NoneInMemoryRange)?;
+    let array_size = felt_from_ptr(vm, ptr)?;
+    let array_data_ptr = vm.get_relocatable((ptr + 1)?)?;
 
-    Ok(felt_range_from_ptr(vm, &array_data_ptr, usize::try_from(array_size)?)?)
+    Ok(felt_range_from_ptr(vm, array_data_ptr, usize::try_from(array_size)?)?)
 }
 
 pub fn read_calldata(vm: &VirtualMachine, ptr: Relocatable) -> SyscallResult<Calldata> {
@@ -321,8 +326,8 @@ pub fn read_call_params(
     vm: &VirtualMachine,
     ptr: Relocatable,
 ) -> SyscallResult<(EntryPointSelector, Calldata)> {
-    let function_selector = EntryPointSelector(felt_from_memory_ptr(vm, ptr)?);
-    let calldata = read_calldata(vm, ptr + 1)?;
+    let function_selector = EntryPointSelector(felt_from_ptr(vm, ptr)?);
+    let calldata = read_calldata(vm, (ptr + 1)?)?;
 
     Ok((function_selector, calldata))
 }
@@ -334,6 +339,8 @@ pub fn execute_inner_call(
 ) -> SyscallResult<ReadOnlySegment> {
     let call_info = call.execute(
         syscall_handler.state,
+        syscall_handler.execution_resources,
+        syscall_handler.execution_context,
         syscall_handler.block_context,
         syscall_handler.account_tx_context,
     )?;

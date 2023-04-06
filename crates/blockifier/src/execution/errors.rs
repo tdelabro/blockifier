@@ -1,9 +1,13 @@
+use alloc::boxed::Box;
+use alloc::string::{String, ToString};
+
 use cairo_vm::types::relocatable::Relocatable;
 use cairo_vm::vm::errors as cairo_vm_errors;
-use starknet_api::core::{ContractAddress, EntryPointSelector};
+use num_bigint::{BigInt, TryFromBigIntError};
+use starknet_api::api_core::{ContractAddress, EntryPointSelector};
 use starknet_api::hash::StarkFelt;
 use starknet_api::StarknetApiError;
-use thiserror::Error;
+use thiserror_no_std::Error;
 
 use crate::state::errors::StateError;
 
@@ -34,7 +38,11 @@ impl From<cairo_vm_errors::runner_errors::RunnerError> for PreExecutionError {
 #[derive(Debug, Error)]
 pub enum PostExecutionError {
     #[error(transparent)]
+    MathError(#[from] cairo_vm::types::errors::math_errors::MathError),
+    #[error(transparent)]
     MemoryError(#[from] cairo_vm_errors::memory_errors::MemoryError),
+    #[error(transparent)]
+    RetdataSizeTooBig(#[from] TryFromBigIntError<BigInt>),
     #[error("Validation failed: {0}.")]
     SecurityValidationError(String),
     #[error(transparent)]
@@ -57,6 +65,8 @@ pub enum SyscallExecutionError {
     InvalidSyscallInput { input: StarkFelt, info: String },
     #[error("Invalid syscall selector: {0:?}.")]
     InvalidSyscallSelector(StarkFelt),
+    #[error(transparent)]
+    MathError(#[from] cairo_vm::types::errors::math_errors::MathError),
     #[error(transparent)]
     MemoryError(#[from] cairo_vm_errors::memory_errors::MemoryError),
     #[error(transparent)]

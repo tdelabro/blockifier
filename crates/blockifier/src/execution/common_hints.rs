@@ -1,8 +1,9 @@
-use std::collections::HashMap;
-use std::ops::Shl;
-use std::rc::Rc;
+use alloc::boxed::Box;
+use alloc::rc::Rc;
+use alloc::string::{String, ToString};
+use core::ops::Shl;
 
-use cairo_felt::{Felt, PRIME_STR};
+use cairo_felt::{Felt252, PRIME_STR};
 use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_definition::{
     BuiltinHintProcessor, HintFunc,
 };
@@ -18,6 +19,7 @@ use cairo_vm::vm::vm_core::VirtualMachine;
 use num_bigint::BigUint;
 use num_traits::{Num, One, Zero};
 
+use crate::collections::HashMap;
 use crate::execution::hint_code::{
     NORMALIZE_ADDRESS_SET_IS_250_HINT, NORMALIZE_ADDRESS_SET_IS_SMALL_HINT,
 };
@@ -30,7 +32,7 @@ pub fn normalize_address_set_is_small(
     _execution_scopes: &mut ExecutionScopes,
     ids_data: &HashMap<String, HintReference>,
     ap_tracking: &ApTracking,
-    constants: &HashMap<String, Felt>,
+    constants: &HashMap<String, Felt252>,
 ) -> HintExecutionResult {
     const ADDR_BOUND: &str = "starkware.starknet.common.storage.ADDR_BOUND";
     let addr_bound =
@@ -50,7 +52,7 @@ pub fn normalize_address_set_is_small(
         )));
     }
 
-    let is_small = if addr < *addr_bound { Felt::one() } else { Felt::zero() };
+    let is_small = if addr < *addr_bound { Felt252::one() } else { Felt252::zero() };
     insert_value_from_var_name("is_small", is_small, vm, ids_data, ap_tracking)
 }
 
@@ -60,11 +62,12 @@ pub fn normalize_address_set_is_250(
     _execution_scopes: &mut ExecutionScopes,
     ids_data: &HashMap<String, HintReference>,
     ap_tracking: &ApTracking,
-    _constants: &HashMap<String, Felt>,
+    _constants: &HashMap<String, Felt252>,
 ) -> HintExecutionResult {
     let addr = get_integer_from_var_name("addr", vm, ids_data, ap_tracking)?;
 
-    let is_250 = if *addr < (Felt::one() << (250_u32)) { Felt::one() } else { Felt::zero() };
+    let is_250 =
+        if *addr < (Felt252::one() << (250_u32)) { Felt252::one() } else { Felt252::zero() };
     insert_value_from_var_name("is_250", is_250, vm, ids_data, ap_tracking)
 }
 

@@ -1,32 +1,37 @@
-use std::collections::HashMap;
+use alloc::borrow::ToOwned;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
-use cairo_felt::Felt;
+use cairo_felt::Felt252;
 use cairo_vm::serde::deserialize_program::{
-    deserialize_array_of_bigint_hex, deserialize_felt_hex, Attribute, BuiltinName, HintParams,
-    Identifier, ReferenceManager,
+    deserialize_array_of_bigint_hex, deserialize_felt_hex, Attribute, HintParams, Identifier,
+    ReferenceManager,
 };
 use cairo_vm::types::errors::program_errors::ProgramError;
 use cairo_vm::types::program::Program;
 use cairo_vm::types::relocatable::{MaybeRelocatable, Relocatable};
 use cairo_vm::vm::errors::memory_errors::MemoryError;
 use cairo_vm::vm::errors::vm_errors::VirtualMachineError;
-use cairo_vm::vm::runners::cairo_runner::{CairoArg, CairoRunner};
+use cairo_vm::vm::runners::cairo_runner::{
+    CairoArg, CairoRunner, ExecutionResources as VmExecutionResources,
+};
 use cairo_vm::vm::vm_core::VirtualMachine;
-use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector};
+use starknet_api::api_core::{ClassHash, ContractAddress, EntryPointSelector};
+use starknet_api::deprecated_contract_class::{EntryPointType, Program as DeprecatedProgram};
 use starknet_api::hash::StarkFelt;
-use starknet_api::state::EntryPointType;
 use starknet_api::transaction::Calldata;
 
+use super::syscalls::SyscallResult;
 use crate::block_context::BlockContext;
+use crate::collections::HashMap;
 use crate::execution::entry_point::{
-    execute_constructor_entry_point, CallEntryPoint, CallExecution, CallInfo,
-    EntryPointExecutionResult, Retdata,
+    execute_constructor_entry_point, CallEntryPoint, CallExecution, CallInfo, CallType,
+    EntryPointExecutionResult, ExecutionContext, ExecutionResources, Retdata,
 };
 use crate::execution::errors::{
     PostExecutionError, PreExecutionError, VirtualMachineExecutionError,
 };
 use crate::execution::syscall_handling::{execute_inner_call, SyscallHintProcessor};
-use crate::execution::syscalls::SyscallResult;
 use crate::state::state_api::State;
 use crate::transaction::objects::AccountTransactionContext;
 
@@ -36,7 +41,7 @@ pub type Args = Vec<CairoArg>;
 #[path = "execution_utils_test.rs"]
 pub mod test;
 
-pub struct ExecutionContext<'a> {
+pub struct VmExecutionContext<'a> {
     pub runner: CairoRunner,
     pub vm: VirtualMachine,
     pub syscall_handler: SyscallHintProcessor<'a>,
@@ -44,22 +49,24 @@ pub struct ExecutionContext<'a> {
     pub entry_point_pc: usize,
 }
 
-pub fn stark_felt_to_felt(stark_felt: StarkFelt) -> Felt {
-    Felt::from_bytes_be(stark_felt.bytes())
+pub fn stark_felt_to_felt(stark_felt: StarkFelt) -> Felt252 {
+    Felt252::from_bytes_be(stark_felt.bytes())
 }
 
-pub fn felt_to_stark_felt(felt: &Felt) -> StarkFelt {
+pub fn felt_to_stark_felt(felt: &Felt252) -> StarkFelt {
     let biguint = format!("{:#x}", felt.to_biguint());
-    StarkFelt::try_from(biguint.as_str()).expect("Felt must be in StarkFelt's range.")
+    StarkFelt::try_from(biguint.as_str()).expect("Felt252 must be in StarkFelt's range.")
 }
 
 pub fn initialize_execution_context<'a>(
     call: &CallEntryPoint,
     class_hash: ClassHash,
     state: &'a mut dyn State,
+    execution_resources: &'a mut ExecutionResources,
+    execution_context: &'a mut ExecutionContext,
     block_context: &'a BlockContext,
     account_tx_context: &'a AccountTransactionContext,
-) -> Result<ExecutionContext<'a>, PreExecutionError> {
+) -> Result<VmExecutionContext<'a>, PreExecutionError> {
     let contract_class = state.get_contract_class(&class_hash)?;
 
     // Resolve initial PC from EP indicator.
@@ -68,7 +75,7 @@ pub fn initialize_execution_context<'a>(
     // Instantiate Cairo runner.
     let program = convert_program_to_cairo_runner_format(&contract_class.program)?;
     let proof_mode = false;
-    let mut runner = CairoRunner::new(&program, "all", proof_mode)?;
+    let mut runner = CairoRunner::new(&program, "all_cairo", proof_mode)?;
 
     let trace_enabled = true;
     let mut vm = VirtualMachine::new(trace_enabled);
@@ -80,6 +87,8 @@ pub fn initialize_execution_context<'a>(
     let initial_syscall_ptr = vm.add_memory_segment();
     let syscall_handler = SyscallHintProcessor::new(
         state,
+        execution_resources,
+        execution_context,
         block_context,
         account_tx_context,
         initial_syscall_ptr,
@@ -87,7 +96,7 @@ pub fn initialize_execution_context<'a>(
         call.caller_address,
     );
 
-    Ok(ExecutionContext { runner, vm, syscall_handler, initial_syscall_ptr, entry_point_pc })
+    Ok(VmExecutionContext { runner, vm, syscall_handler, initial_syscall_ptr, entry_point_pc })
 }
 
 pub fn prepare_call_arguments(
@@ -107,9 +116,7 @@ pub fn prepare_call_arguments(
     let mut implicit_args = vec![];
     implicit_args.push(MaybeRelocatable::from(initial_syscall_ptr));
     implicit_args.extend(
-        vm.get_builtin_runners()
-            .iter()
-            .flat_map(|(_name, builtin_runner)| builtin_runner.initial_stack()),
+        vm.get_builtin_runners().iter().flat_map(|builtin_runner| builtin_runner.initial_stack()),
     );
     args.push(CairoArg::from(implicit_args.clone()));
 
@@ -131,48 +138,63 @@ pub fn execute_entry_point_call(
     call: CallEntryPoint,
     class_hash: ClassHash,
     state: &mut dyn State,
+    execution_resources: &mut ExecutionResources,
+    execution_context: &mut ExecutionContext,
     block_context: &BlockContext,
     account_tx_context: &AccountTransactionContext,
 ) -> EntryPointExecutionResult<CallInfo> {
-    let mut execution_context =
-        initialize_execution_context(&call, class_hash, state, block_context, account_tx_context)?;
+    let VmExecutionContext {
+        mut runner,
+        mut vm,
+        mut syscall_handler,
+        initial_syscall_ptr,
+        entry_point_pc,
+    } = initialize_execution_context(
+        &call,
+        class_hash,
+        state,
+        execution_resources,
+        execution_context,
+        block_context,
+        account_tx_context,
+    )?;
+
     let (implicit_args, args) = prepare_call_arguments(
         &call,
-        &mut execution_context.vm,
-        execution_context.initial_syscall_ptr,
-        &mut execution_context.syscall_handler.read_only_segments,
+        &mut vm,
+        initial_syscall_ptr,
+        &mut syscall_handler.read_only_segments,
     )?;
     let n_total_args = args.len();
 
-    run_entry_point(
-        &mut execution_context.runner,
-        &mut execution_context.vm,
-        execution_context.entry_point_pc,
-        args,
-        &mut execution_context.syscall_handler,
-    )?;
+    // Fix the VM resources, in order to calculate the usage of this run at the end.
+    let previous_vm_resources = syscall_handler.execution_resources.vm_resources.clone();
+
+    // Execute.
+    run_entry_point(&mut vm, &mut runner, &mut syscall_handler, entry_point_pc, args)?;
 
     Ok(finalize_execution(
-        execution_context.vm,
-        execution_context.runner,
+        vm,
+        runner,
+        syscall_handler,
         call,
-        execution_context.syscall_handler,
+        previous_vm_resources,
         implicit_args,
         n_total_args,
     )?)
 }
 
+/// Runs the runner from the given PC.
 pub fn run_entry_point(
-    runner: &mut CairoRunner,
     vm: &mut VirtualMachine,
+    runner: &mut CairoRunner,
+    hint_processor: &mut SyscallHintProcessor<'_>,
     entry_point_pc: usize,
     args: Args,
-    hint_processor: &mut SyscallHintProcessor<'_>,
 ) -> Result<(), VirtualMachineExecutionError> {
     let verify_secure = true;
     let args: Vec<&CairoArg> = args.iter().collect();
-
-    runner.run_from_entrypoint(entry_point_pc, &args, verify_secure, vm, hint_processor)?;
+    runner.run_from_entrypoint(entry_point_pc, &args, verify_secure, None, vm, hint_processor)?;
 
     Ok(())
 }
@@ -180,26 +202,37 @@ pub fn run_entry_point(
 pub fn finalize_execution(
     mut vm: VirtualMachine,
     runner: CairoRunner,
-    call: CallEntryPoint,
     syscall_handler: SyscallHintProcessor<'_>,
+    call: CallEntryPoint,
+    previous_vm_resources: VmExecutionResources,
     implicit_args: Vec<MaybeRelocatable>,
     n_total_args: usize,
 ) -> Result<CallInfo, PostExecutionError> {
-    // The arguments and RO segments are touched by the OS and should not be counted as
-    // holes, mark them as accessed.
-    let args_ptr = runner
+    // Close memory holes in segments (OS code touches those memory cells, we simulate it).
+    let initial_fp = runner
         .get_initial_fp()
-        .expect("The initial_fp field should be initialized after running the entry point.")
-        // When execution starts the stack holds the EP arguments + [ret_fp, ret_pc].
-        .sub_usize(n_total_args + 2)?;
+        .expect("The initial_fp field should be initialized after running the entry point.");
+    // When execution starts the stack holds the EP arguments + [ret_fp, ret_pc].
+    let args_ptr = (initial_fp - (n_total_args + 2))?;
     vm.mark_address_range_as_accessed(args_ptr, n_total_args)?;
-
-    let [retdata_size, retdata_ptr]: [MaybeRelocatable; 2] =
-        vm.get_return_values(2)?.try_into().expect("Return values must be of size 2.");
-    let implicit_args_end_ptr = vm.get_ap().sub_usize(2)?;
-    validate_run(&mut vm, runner, implicit_args, implicit_args_end_ptr, &syscall_handler)?;
     syscall_handler.read_only_segments.mark_as_accessed(&mut vm)?;
 
+    // Validate run.
+    let [retdata_size, retdata_ptr]: [MaybeRelocatable; 2] =
+        vm.get_return_values(2)?.try_into().expect("Return values must be of size 2.");
+    let implicit_args_end_ptr = (vm.get_ap() - 2)?;
+    validate_run(&mut vm, &runner, &syscall_handler, implicit_args, implicit_args_end_ptr)?;
+
+    // Take into account the VM execution resources of the current call, without inner calls.
+    // Has to happen after marking holes in segments as accessed.
+    let vm_resources_without_inner_calls = runner
+        .get_execution_resources(&vm)
+        .map_err(VirtualMachineError::TracerError)?
+        .filter_unused_builtins();
+    syscall_handler.execution_resources.vm_resources += &vm_resources_without_inner_calls;
+
+    let full_call_vm_resources =
+        &syscall_handler.execution_resources.vm_resources - &previous_vm_resources;
     Ok(CallInfo {
         call,
         execution: CallExecution {
@@ -207,6 +240,7 @@ pub fn finalize_execution(
             events: syscall_handler.events,
             l2_to_l1_messages: syscall_handler.l2_to_l1_messages,
         },
+        vm_resources: full_call_vm_resources.filter_unused_builtins(),
         inner_calls: syscall_handler.inner_calls,
         storage_read_values: syscall_handler.read_values,
         accessed_storage_keys: syscall_handler.accessed_keys,
@@ -215,10 +249,10 @@ pub fn finalize_execution(
 
 pub fn validate_run(
     vm: &mut VirtualMachine,
-    runner: CairoRunner,
+    runner: &CairoRunner,
+    syscall_handler: &SyscallHintProcessor<'_>,
     implicit_args: Vec<MaybeRelocatable>,
     implicit_args_end: Relocatable,
-    syscall_handler: &SyscallHintProcessor<'_>,
 ) -> Result<(), PostExecutionError> {
     // Validate builtins' final stack.
     let mut current_builtin_ptr = implicit_args_end;
@@ -226,8 +260,8 @@ pub fn validate_run(
 
     // Validate implicit arguments segment length is unchanged.
     // Subtract one to get to the first implicit arg segment (the syscall pointer).
-    let implicit_args_start = current_builtin_ptr.sub_usize(1)?;
-    if implicit_args_start + implicit_args.len() != implicit_args_end {
+    let implicit_args_start = (current_builtin_ptr - 1)?;
+    if (implicit_args_start + implicit_args.len())? != implicit_args_end {
         return Err(PostExecutionError::SecurityValidationError(
             "Implicit arguments' segments".to_string(),
         ));
@@ -247,7 +281,7 @@ pub fn validate_run(
     let syscall_used_size = vm
         .get_segment_used_size(syscall_start_ptr.segment_index as usize)
         .expect("Segments must contain the syscall segment.");
-    if syscall_start_ptr + syscall_used_size != syscall_end_ptr {
+    if (syscall_start_ptr + syscall_used_size)? != syscall_end_ptr {
         return Err(PostExecutionError::SecurityValidationError(
             "Syscall segment size".to_string(),
         ));
@@ -267,29 +301,36 @@ fn read_execution_retdata(
     retdata_ptr: MaybeRelocatable,
 ) -> Result<Retdata, PostExecutionError> {
     let retdata_size = match retdata_size {
-        MaybeRelocatable::Int(retdata_size) => retdata_size.bits() as usize,
+        MaybeRelocatable::Int(retdata_size) => usize::try_from(retdata_size.to_bigint())
+            .map_err(PostExecutionError::RetdataSizeTooBig)?,
         relocatable => {
             return Err(VirtualMachineError::ExpectedIntAtRange(Some(relocatable)).into());
         }
     };
 
-    Ok(Retdata(felt_range_from_ptr(&vm, &retdata_ptr, retdata_size)?))
+    Ok(Retdata(felt_range_from_ptr(&vm, Relocatable::try_from(&retdata_ptr)?, retdata_size)?))
+}
+
+pub fn felt_from_ptr(
+    vm: &VirtualMachine,
+    ptr: Relocatable,
+) -> Result<StarkFelt, VirtualMachineError> {
+    Ok(felt_to_stark_felt(vm.get_integer(ptr)?.as_ref()))
 }
 
 pub fn felt_range_from_ptr(
     vm: &VirtualMachine,
-    ptr: &MaybeRelocatable,
+    ptr: Relocatable,
     size: usize,
 ) -> Result<Vec<StarkFelt>, VirtualMachineError> {
-    let values = vm.get_continuous_range(ptr, size)?;
+    let values = vm.get_integer_range(ptr, size)?;
     // Extract values as `StarkFelt`.
-    let values: Result<Vec<StarkFelt>, VirtualMachineError> =
-        values.into_iter().map(felt_from_memory_cell).collect();
-    values
+    let values = values.into_iter().map(|felt| felt_to_stark_felt(felt.as_ref())).collect();
+    Ok(values)
 }
 
 pub fn convert_program_to_cairo_runner_format(
-    program: &starknet_api::state::Program,
+    program: &DeprecatedProgram,
 ) -> Result<Program, ProgramError> {
     let program = program.clone();
     let identifiers = serde_json::from_value::<HashMap<String, Identifier>>(program.identifiers)?;
@@ -304,10 +345,7 @@ pub fn convert_program_to_cairo_runner_format(
     };
 
     Ok(Program {
-        builtins: serde_json::from_value::<Vec<BuiltinName>>(program.builtins)?
-            .iter()
-            .map(BuiltinName::name)
-            .collect(),
+        builtins: serde_json::from_value(program.builtins)?,
         prime: deserialize_felt_hex(program.prime)?.to_string(),
         data: deserialize_array_of_bigint_hex(program.data)?,
         constants: {
@@ -338,24 +376,6 @@ pub fn convert_program_to_cairo_runner_format(
     })
 }
 
-pub fn felt_from_memory_ptr(
-    vm: &VirtualMachine,
-    memory_ptr: Relocatable,
-) -> Result<StarkFelt, VirtualMachineError> {
-    let maybe_relocatable =
-        vm.get_maybe(&memory_ptr).ok_or(VirtualMachineError::NoneInMemoryRange)?;
-    felt_from_memory_cell(maybe_relocatable)
-}
-
-pub fn felt_from_memory_cell(
-    memory_cell: MaybeRelocatable,
-) -> Result<StarkFelt, VirtualMachineError> {
-    match memory_cell {
-        MaybeRelocatable::Int(value) => Ok(felt_to_stark_felt(&value)),
-        _ => Err(VirtualMachineError::ExpectedIntAtRange(Some(memory_cell))),
-    }
-}
-
 #[derive(Debug)]
 // Invariant: read-only.
 pub struct ReadOnlySegment {
@@ -376,11 +396,11 @@ impl ReadOnlySegments {
     ) -> Result<Relocatable, MemoryError> {
         let start_ptr = vm.add_memory_segment();
         self.0.push(ReadOnlySegment { start_ptr, length: data.len() });
-        vm.load_data(&MaybeRelocatable::from(start_ptr), data)?;
+        vm.load_data(start_ptr, data)?;
         Ok(start_ptr)
     }
 
-    pub fn validate(&self, vm: &mut VirtualMachine) -> Result<(), PostExecutionError> {
+    pub fn validate(&self, vm: &VirtualMachine) -> Result<(), PostExecutionError> {
         for segment in &self.0 {
             let used_size = vm
                 .get_segment_used_size(segment.start_ptr.segment_index as usize)
@@ -395,8 +415,8 @@ impl ReadOnlySegments {
         Ok(())
     }
 
-    pub fn mark_as_accessed(self, vm: &mut VirtualMachine) -> Result<(), PostExecutionError> {
-        for segment in self.0 {
+    pub fn mark_as_accessed(&self, vm: &mut VirtualMachine) -> Result<(), PostExecutionError> {
+        for segment in &self.0 {
             vm.mark_address_range_as_accessed(segment.start_ptr, segment.length)?;
         }
 
@@ -406,8 +426,11 @@ impl ReadOnlySegments {
 
 /// Instantiates the given class and assigns it an address.
 /// Returns the call info of the deployed class' constructor execution.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_deployment(
     state: &mut dyn State,
+    execution_resources: &mut ExecutionResources,
+    execution_context: &mut ExecutionContext,
     block_context: &BlockContext,
     account_tx_context: &AccountTransactionContext,
     class_hash: ClassHash,
@@ -420,6 +443,8 @@ pub fn execute_deployment(
     state.set_class_hash_at(deployed_contract_address, class_hash)?;
     execute_constructor_entry_point(
         state,
+        execution_resources,
+        execution_context,
         block_context,
         account_tx_context,
         class_hash,
@@ -447,6 +472,7 @@ pub fn execute_library_call(
         // The call context remains the same in a library call.
         storage_address: syscall_handler.storage_address,
         caller_address: syscall_handler.caller_address,
+        call_type: CallType::Delegate,
     };
 
     execute_inner_call(entry_point, vm, syscall_handler)

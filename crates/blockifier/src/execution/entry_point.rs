@@ -1,17 +1,23 @@
-use std::collections::HashSet;
+use alloc::string::ToString;
+use alloc::vec::Vec;
 
-use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector};
-use starknet_api::hash::StarkFelt;
-use starknet_api::state::{EntryPointType, StorageKey};
-use starknet_api::transaction::{Calldata, EventContent, MessageToL1};
+use cairo_vm::vm::runners::cairo_runner::ExecutionResources as VmExecutionResources;
+use starknet_api::api_core::{ClassHash, ContractAddress, EntryPointSelector};
+use starknet_api::deprecated_contract_class::{EntryPoint, EntryPointType};
+use starknet_api::hash::{StarkFelt, StarkHash};
+use starknet_api::state::StorageKey;
+use starknet_api::transaction::{Calldata, EthAddress, EventContent, L2ToL1Payload};
 
 use crate::abi::abi_utils::selector_from_name;
-use crate::abi::constants::CONSTRUCTOR_ENTRY_POINT_NAME;
+use crate::abi::constants::{CONSTRUCTOR_ENTRY_POINT_NAME, DEFAULT_ENTRY_POINT_SELECTOR};
 use crate::block_context::BlockContext;
+use crate::collections::HashSet;
 use crate::execution::contract_class::ContractClass;
 use crate::execution::errors::{EntryPointExecutionError, PreExecutionError};
 use crate::execution::execution_utils::execute_entry_point_call;
+use crate::execution::syscall_handling::SyscallCounter;
 use crate::state::state_api::State;
+use crate::transaction::errors::TransactionExecutionError;
 use crate::transaction::objects::AccountTransactionContext;
 
 #[cfg(test)]
@@ -20,6 +26,13 @@ pub mod test;
 
 pub type EntryPointExecutionResult<T> = Result<T, EntryPointExecutionError>;
 
+/// Represents a the type of the call (used for debugging).
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum CallType {
+    #[default]
+    Call = 0,
+    Delegate = 1,
+}
 /// Represents a call to an entry point of a StarkNet contract.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct CallEntryPoint {
@@ -30,12 +43,29 @@ pub struct CallEntryPoint {
     pub calldata: Calldata,
     pub storage_address: ContractAddress,
     pub caller_address: ContractAddress,
+    pub call_type: CallType,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct ExecutionResources {
+    pub vm_resources: VmExecutionResources,
+    pub syscall_counter: SyscallCounter,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct ExecutionContext {
+    // Used for tracking events order during the current execution.
+    pub n_emitted_events: usize,
+    // Used for tracking L2-to-L1 messages order during the current execution.
+    pub n_sent_messages_to_l1: usize,
 }
 
 impl CallEntryPoint {
     pub fn execute(
         mut self,
         state: &mut dyn State,
+        execution_resources: &mut ExecutionResources,
+        execution_context: &mut ExecutionContext,
         block_context: &BlockContext,
         account_tx_context: &AccountTransactionContext,
     ) -> EntryPointExecutionResult<CallInfo> {
@@ -52,19 +82,59 @@ impl CallEntryPoint {
         // Add class hash to the call, that will appear in the output (call info).
         self.class_hash = Some(class_hash);
 
-        execute_entry_point_call(self, class_hash, state, block_context, account_tx_context)
+        execute_entry_point_call(
+            self,
+            class_hash,
+            state,
+            execution_resources,
+            execution_context,
+            block_context,
+            account_tx_context,
+        )
     }
 
     pub fn resolve_entry_point_pc(
         &self,
         contract_class: &ContractClass,
     ) -> Result<usize, PreExecutionError> {
+        let not_found_error = Err(PreExecutionError::EntryPointNotFound(self.entry_point_selector));
         let entry_points_of_same_type =
             &contract_class.entry_points_by_type[&self.entry_point_type];
-        match entry_points_of_same_type.iter().find(|ep| ep.selector == self.entry_point_selector) {
-            Some(entry_point) => Ok(entry_point.offset.0),
-            None => Err(PreExecutionError::EntryPointNotFound(self.entry_point_selector)),
+        let filtered_entry_points: Vec<&EntryPoint> = entry_points_of_same_type
+            .iter()
+            .filter(|ep| ep.selector == self.entry_point_selector)
+            .collect();
+
+        // Returns the default entrypoint if the given selector is missing.
+        if filtered_entry_points.is_empty() {
+            match entry_points_of_same_type.get(0) {
+                Some(entry_point) => {
+                    if entry_point.selector
+                        == EntryPointSelector(StarkHash::from(DEFAULT_ENTRY_POINT_SELECTOR))
+                    {
+                        return Ok(entry_point.offset.0);
+                    } else {
+                        // No default entry point.
+                        return not_found_error;
+                    }
+                }
+                None => {
+                    // No entry points of the correct type.
+                    return not_found_error;
+                }
+            }
         }
+
+        // Non-unique entry points are not possible.
+        if filtered_entry_points.len() > 1 {
+            return not_found_error;
+        }
+
+        // Filtered entry points contain exactly one element.
+        let entry_point = filtered_entry_points
+            .get(0)
+            .expect("The number of entry points with the given selector is exactly one.");
+        Ok(entry_point.offset.0)
     }
 }
 
@@ -85,6 +155,12 @@ pub struct OrderedEvent {
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
+pub struct MessageToL1 {
+    pub to_address: EthAddress,
+    pub payload: L2ToL1Payload,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct OrderedL2ToL1Message {
     pub order: usize,
     pub message: MessageToL1,
@@ -100,10 +176,38 @@ pub struct CallExecution {
 pub struct CallInfo {
     pub call: CallEntryPoint,
     pub execution: CallExecution,
+    pub vm_resources: VmExecutionResources,
     pub inner_calls: Vec<CallInfo>,
+
     // Additional information gathered during execution.
     pub storage_read_values: Vec<StarkFelt>,
     pub accessed_storage_keys: HashSet<StorageKey>,
+}
+
+impl CallInfo {
+    /// Returns a list of StarkNet L2ToL1Payload length collected during the execution, sorted
+    /// by the order in which they were sent.
+    pub fn get_sorted_l2_to_l1_payloads_length(
+        &self,
+    ) -> Result<Vec<usize>, TransactionExecutionError> {
+        let n_messages = self.into_iter().map(|call| call.execution.l2_to_l1_messages.len()).sum();
+        let mut starknet_l2_to_l1_payloads_length: Vec<Option<usize>> = vec![None; n_messages];
+
+        for call in self.into_iter() {
+            for ordered_message_content in &call.execution.l2_to_l1_messages {
+                if starknet_l2_to_l1_payloads_length[ordered_message_content.order].is_some() {
+                    return Err(TransactionExecutionError::UnexpectedHoles {
+                        object: "L2-to-L1 message".to_string(),
+                        order: ordered_message_content.order,
+                    });
+                }
+                starknet_l2_to_l1_payloads_length[ordered_message_content.order] =
+                    Some(ordered_message_content.message.payload.0.len());
+            }
+        }
+
+        Ok(starknet_l2_to_l1_payloads_length.into_iter().flatten().collect())
+    }
 }
 
 pub struct CallInfoIter<'a> {
@@ -133,8 +237,11 @@ impl<'a> IntoIterator for &'a CallInfo {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_constructor_entry_point(
     state: &mut dyn State,
+    execution_resources: &mut ExecutionResources,
+    execution_context: &mut ExecutionContext,
     block_context: &BlockContext,
     account_tx_context: &AccountTransactionContext,
     class_hash: ClassHash,
@@ -159,8 +266,16 @@ pub fn execute_constructor_entry_point(
         calldata,
         storage_address,
         caller_address,
+        call_type: CallType::Call,
     };
-    constructor_call.execute(state, block_context, account_tx_context)
+
+    constructor_call.execute(
+        state,
+        execution_resources,
+        execution_context,
+        block_context,
+        account_tx_context,
+    )
 }
 
 pub fn handle_empty_constructor(
@@ -185,6 +300,7 @@ pub fn handle_empty_constructor(
             calldata: Calldata::default(),
             storage_address,
             caller_address,
+            call_type: CallType::Call,
         },
         ..Default::default()
     };

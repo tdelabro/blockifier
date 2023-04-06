@@ -1,14 +1,15 @@
-use std::collections::HashSet;
+use alloc::string::ToString;
 
 use num_bigint::BigInt;
 use pretty_assertions::assert_eq;
-use starknet_api::core::{EntryPointSelector, PatriciaKey};
+use starknet_api::api_core::{EntryPointSelector, PatriciaKey};
 use starknet_api::hash::{StarkFelt, StarkHash};
 use starknet_api::state::StorageKey;
 use starknet_api::transaction::Calldata;
 use starknet_api::{calldata, patricia_key, stark_felt};
 
 use crate::abi::abi_utils::{get_storage_var_address, selector_from_name};
+use crate::collections::HashSet;
 use crate::execution::entry_point::{CallEntryPoint, CallExecution, CallInfo, Retdata};
 use crate::retdata;
 use crate::state::cached_state::CachedState;
@@ -74,6 +75,27 @@ fn test_entry_point_with_arg() {
     assert_eq!(
         entry_point_call.execute_directly(&mut state).unwrap().execution,
         CallExecution::default()
+    );
+}
+
+#[test]
+fn test_long_retdata() {
+    let mut state = create_test_state();
+    let calldata = calldata![];
+    let entry_point_call = CallEntryPoint {
+        calldata,
+        entry_point_selector: selector_from_name("test_long_retdata"),
+        ..trivial_external_entry_point()
+    };
+    assert_eq!(
+        entry_point_call.execute_directly(&mut state).unwrap().execution,
+        CallExecution::from_retdata(retdata![
+            stark_felt!(0),
+            stark_felt!(1),
+            stark_felt!(2),
+            stark_felt!(3),
+            stark_felt!(4)
+        ])
     );
 }
 
@@ -190,14 +212,14 @@ fn test_vm_execution_security_failures() {
     );
 
     run_security_test(
-        "Can only subtract two relocatable values of the same segment",
+        "can't subtract two relocatable values with different segment indexes",
         "test_subtraction_between_relocatables",
         calldata![],
         &mut state,
     );
 
     run_security_test(
-        "Cannot add two relocatable values",
+        "can't add two relocatable values",
         "test_relocatables_addition_failure",
         calldata![],
         &mut state,
@@ -227,7 +249,7 @@ fn test_vm_execution_security_failures() {
     );
 
     run_security_test(
-        "exceeds maximum offset value",
+        "maximum offset value exceeded",
         "test_out_of_bound_memory_value",
         calldata![],
         &mut state,
@@ -331,7 +353,7 @@ fn test_syscall_execution_security_failures() {
     );
 
     run_security_test(
-        "Custom Hint Error: Found a memory gap when calling get_continuous_range",
+        "Custom Hint Error: Expected relocatable",
         "test_bad_syscall_request_arg_type",
         calldata![],
         &mut state,

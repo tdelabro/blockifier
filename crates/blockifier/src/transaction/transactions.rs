@@ -1,21 +1,28 @@
-use std::sync::Arc;
+use alloc::string::String;
+use alloc::sync::Arc;
 
-use starknet_api::core::ContractAddress;
-use starknet_api::state::EntryPointType;
+use starknet_api::api_core::ContractAddress;
+use starknet_api::deprecated_contract_class::EntryPointType;
 use starknet_api::transaction::{
-    Calldata, DeclareTransaction, DeployAccountTransaction, InvokeTransaction, L1HandlerTransaction,
+    Calldata, DeclareTransaction, DeployAccountTransaction, InvokeTransactionV1,
+    L1HandlerTransaction,
 };
 
 use crate::abi::abi_utils::selector_from_name;
 use crate::block_context::BlockContext;
 use crate::execution::contract_class::ContractClass;
-use crate::execution::entry_point::{CallEntryPoint, CallInfo};
+use crate::execution::entry_point::{
+    CallEntryPoint, CallInfo, CallType, ExecutionContext, ExecutionResources,
+};
 use crate::execution::execution_utils::execute_deployment;
 use crate::state::cached_state::{CachedState, MutRefState, TransactionalState};
 use crate::state::errors::StateError;
 use crate::state::state_api::{State, StateReader};
 use crate::transaction::constants;
-use crate::transaction::errors::{DeclareTransactionError, TransactionExecutionError};
+use crate::transaction::errors::{
+    ContractConstructorExecutionError, DeclareTransactionError, ExecuteTransactionError,
+    TransactionExecutionError,
+};
 use crate::transaction::objects::{
     AccountTransactionContext, TransactionExecutionInfo, TransactionExecutionResult,
 };
@@ -33,15 +40,18 @@ pub trait ExecutableTransaction<S: StateReader>: Sized {
         state: &mut CachedState<S>,
         block_context: &BlockContext,
     ) -> TransactionExecutionResult<TransactionExecutionInfo> {
+        log::debug!("Executing Transaction...");
         let mut transactional_state = CachedState::new(MutRefState::new(state));
         let execution_result = self.execute_raw(&mut transactional_state, block_context);
 
         match execution_result {
             Ok(value) => {
                 transactional_state.commit();
+                log::debug!("Transaction execution complete and committed.");
                 Ok(value)
             }
             Err(error) => {
+                log::warn!("Transaction execution failed with: {error}");
                 transactional_state.abort();
                 Err(error)
             }
@@ -61,9 +71,10 @@ pub trait Executable<S: State> {
     fn run_execute(
         &self,
         state: &mut S,
+        execution_resources: &mut ExecutionResources,
         block_context: &BlockContext,
         account_tx_context: &AccountTransactionContext,
-        // Only used for `DeclareTransaction`.
+        // Only used for declare transaction.
         contract_class: Option<ContractClass>,
     ) -> TransactionExecutionResult<Option<CallInfo>>;
 }
@@ -72,15 +83,18 @@ impl<S: State> Executable<S> for DeclareTransaction {
     fn run_execute(
         &self,
         state: &mut S,
+        _execution_resources: &mut ExecutionResources,
         _block_context: &BlockContext,
         _account_tx_context: &AccountTransactionContext,
         contract_class: Option<ContractClass>,
     ) -> TransactionExecutionResult<Option<CallInfo>> {
-        match state.get_contract_class(&self.class_hash) {
+        let class_hash = self.class_hash();
+
+        match state.get_contract_class(&class_hash) {
             Err(StateError::UndeclaredClassHash(_)) => {
                 // Class is undeclared; declare it.
                 state.set_contract_class(
-                    &self.class_hash,
+                    &class_hash,
                     contract_class.expect("Declare transaction must have a contract_class"),
                 )?;
 
@@ -89,8 +103,7 @@ impl<S: State> Executable<S> for DeclareTransaction {
             Err(error) => Err(error).map_err(TransactionExecutionError::from),
             Ok(_) => {
                 // Class is already declared; cannot redeclare.
-                Err(DeclareTransactionError::ClassAlreadyDeclared { class_hash: self.class_hash })
-                    .map_err(TransactionExecutionError::from)
+                Err(DeclareTransactionError::ClassAlreadyDeclared { class_hash })?
             }
         }
     }
@@ -100,29 +113,36 @@ impl<S: State> Executable<S> for DeployAccountTransaction {
     fn run_execute(
         &self,
         state: &mut S,
+        execution_resources: &mut ExecutionResources,
         block_context: &BlockContext,
         account_tx_context: &AccountTransactionContext,
         _contract_class: Option<ContractClass>,
     ) -> TransactionExecutionResult<Option<CallInfo>> {
-        let call_info = execute_deployment(
+        let mut execution_context = ExecutionContext::default();
+        let deployment_result = execute_deployment(
             state,
+            execution_resources,
+            &mut execution_context,
             block_context,
             account_tx_context,
             self.class_hash,
             self.contract_address,
             ContractAddress::default(),
             self.constructor_calldata.clone(),
-        )?;
+        );
+        let call_info = deployment_result
+            .map_err(ContractConstructorExecutionError::ContractConstructorExecutionFailed)?;
         verify_no_calls_to_other_contracts(&call_info, String::from("an account constructor"))?;
 
         Ok(Some(call_info))
     }
 }
 
-impl<S: State> Executable<S> for InvokeTransaction {
+impl<S: State> Executable<S> for InvokeTransactionV1 {
     fn run_execute(
         &self,
         state: &mut S,
+        execution_resources: &mut ExecutionResources,
         block_context: &BlockContext,
         account_tx_context: &AccountTransactionContext,
         _contract_class: Option<ContractClass>,
@@ -134,9 +154,20 @@ impl<S: State> Executable<S> for InvokeTransaction {
             class_hash: None,
             storage_address: self.sender_address,
             caller_address: ContractAddress::default(),
+            call_type: CallType::Call,
         };
+        let mut execution_context = ExecutionContext::default();
 
-        Ok(Some(execute_call.execute(state, block_context, account_tx_context)?))
+        let call_info = execute_call
+            .execute(
+                state,
+                execution_resources,
+                &mut execution_context,
+                block_context,
+                account_tx_context,
+            )
+            .map_err(ExecuteTransactionError::ExecutionError)?;
+        Ok(Some(call_info))
     }
 }
 
@@ -144,6 +175,7 @@ impl<S: State> Executable<S> for L1HandlerTransaction {
     fn run_execute(
         &self,
         state: &mut S,
+        execution_resources: &mut ExecutionResources,
         block_context: &BlockContext,
         account_tx_context: &AccountTransactionContext,
         _contract_class: Option<ContractClass>,
@@ -155,8 +187,19 @@ impl<S: State> Executable<S> for L1HandlerTransaction {
             class_hash: None,
             storage_address: self.contract_address,
             caller_address: ContractAddress::default(),
+            call_type: CallType::Call,
         };
+        let mut execution_context = ExecutionContext::default();
 
-        Ok(Some(execute_call.execute(state, block_context, account_tx_context)?))
+        let call_info = execute_call
+            .execute(
+                state,
+                execution_resources,
+                &mut execution_context,
+                block_context,
+                account_tx_context,
+            )
+            .map_err(ExecuteTransactionError::ExecutionError)?;
+        Ok(Some(call_info))
     }
 }

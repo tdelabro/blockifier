@@ -1,11 +1,16 @@
-use std::collections::HashMap;
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
+use std::collections::hash_map::RandomState as HasherBuilder;
 
 use derive_more::IntoIterator;
+#[cfg(not(feature = "std"))]
+use hashbrown::hash_map::DefaultHashBuilder as HasherBuilder;
 use indexmap::IndexMap;
-use starknet_api::core::{ClassHash, ContractAddress, Nonce};
+use starknet_api::api_core::{ClassHash, ContractAddress, Nonce};
 use starknet_api::hash::StarkFelt;
 use starknet_api::state::{StateDiff, StorageKey};
 
+use crate::collections::{HashMap, HashSet};
 use crate::execution::contract_class::ContractClass;
 use crate::state::errors::StateError;
 use crate::state::state_api::{State, StateReader, StateResult};
@@ -15,7 +20,7 @@ use crate::utils::subtract_mappings;
 #[path = "cached_state_test.rs"]
 mod test;
 
-pub type ContractClassMapping = HashMap<ClassHash, ContractClass>;
+type ContractClassMapping = HashMap<ClassHash, Arc<ContractClass>>;
 pub type TransactionalState<'a, S> = CachedState<MutRefState<'a, CachedState<S>>>;
 
 /// Caches read and write requests.
@@ -33,6 +38,22 @@ pub struct CachedState<S: StateReader> {
 impl<S: StateReader> CachedState<S> {
     pub fn new(state: S) -> Self {
         Self { state, cache: StateCache::default(), class_hash_to_class: HashMap::default() }
+    }
+
+    /// Returns the number of storage changes done through this state.
+    /// Any change to the contract's state (storage, nonce, class hash) is considered.
+    // TODO(Noa, 30/04/23): Add nonce count.
+    pub fn count_actual_state_changes(&self) -> (usize, usize, usize) {
+        // Storage Update.
+        let storage_updates = &self.cache.get_storage_updates();
+        let mut modified_contracts: HashSet<ContractAddress> =
+            storage_updates.keys().map(|address_key_pair| address_key_pair.0).collect();
+
+        // Class hash Update (deployed contracts).
+        let class_hash_updates = &self.cache.get_class_hash_updates();
+        modified_contracts.extend(class_hash_updates.keys());
+
+        (storage_updates.len(), modified_contracts.len(), class_hash_updates.len())
     }
 }
 
@@ -79,7 +100,7 @@ impl<S: StateReader> StateReader for CachedState<S> {
         Ok(*class_hash)
     }
 
-    fn get_contract_class(&mut self, class_hash: &ClassHash) -> StateResult<ContractClass> {
+    fn get_contract_class(&mut self, class_hash: &ClassHash) -> StateResult<Arc<ContractClass>> {
         if !self.class_hash_to_class.contains_key(class_hash) {
             let contract_class = self.state.get_contract_class(class_hash)?;
             self.class_hash_to_class.insert(*class_hash, contract_class);
@@ -136,32 +157,32 @@ impl<S: StateReader> State for CachedState<S> {
         class_hash: &ClassHash,
         contract_class: ContractClass,
     ) -> StateResult<()> {
-        self.class_hash_to_class.insert(*class_hash, contract_class);
+        self.class_hash_to_class.insert(*class_hash, Arc::from(contract_class));
         Ok(())
     }
 
     fn to_state_diff(&self) -> StateDiff {
-        type StorageDiff = IndexMap<ContractAddress, IndexMap<StorageKey, StarkFelt>>;
+        type StorageDiff = IndexMap<
+            ContractAddress,
+            IndexMap<StorageKey, StarkFelt, HasherBuilder>,
+            HasherBuilder,
+        >;
 
         let state_cache = &self.cache;
 
         // Contract instance attributes.
-        let deployed_contracts = subtract_mappings(
-            &state_cache.class_hash_writes,
-            &state_cache.class_hash_initial_values,
-        );
-        let storage_diffs =
-            subtract_mappings(&state_cache.storage_writes, &state_cache.storage_initial_values);
+        let deployed_contracts = state_cache.get_class_hash_updates();
+        let storage_diffs = state_cache.get_storage_updates();
         let nonces =
             subtract_mappings(&state_cache.nonce_writes, &state_cache.nonce_initial_values);
-
-        let declared_classes = IndexMap::new();
 
         StateDiff {
             deployed_contracts: IndexMap::from_iter(deployed_contracts),
             storage_diffs: StorageDiff::from(StorageView(storage_diffs)),
-            declared_classes,
+            declared_classes: IndexMap::with_hasher(HasherBuilder::default()),
+            deprecated_declared_classes: IndexMap::with_hasher(HasherBuilder::default()),
             nonces: IndexMap::from_iter(nonces),
+            replaced_classes: IndexMap::with_hasher(HasherBuilder::default()),
         }
     }
 }
@@ -172,16 +193,18 @@ pub type ContractStorageKey = (ContractAddress, StorageKey);
 pub struct StorageView(pub HashMap<ContractStorageKey, StarkFelt>);
 
 /// Converts a `CachedState`'s storage mapping into a `StateDiff`'s storage mapping.
-impl From<StorageView> for IndexMap<ContractAddress, IndexMap<StorageKey, StarkFelt>> {
+impl From<StorageView>
+    for IndexMap<ContractAddress, IndexMap<StorageKey, StarkFelt, HasherBuilder>, HasherBuilder>
+{
     fn from(storage_view: StorageView) -> Self {
-        let mut storage_updates = Self::new();
+        let mut storage_updates = Self::with_capacity_and_hasher(0, HasherBuilder::default());
         for ((address, key), value) in storage_view.into_iter() {
             storage_updates
                 .entry(address)
                 .and_modify(|map| {
                     map.insert(key, value);
                 })
-                .or_insert_with(|| IndexMap::from([(key, value)]));
+                .or_insert_with(|| IndexMap::from_iter([(key, value)]));
         }
 
         storage_updates
@@ -267,6 +290,14 @@ impl StateCache {
     fn set_class_hash_write(&mut self, contract_address: ContractAddress, class_hash: ClassHash) {
         self.class_hash_writes.insert(contract_address, class_hash);
     }
+
+    fn get_storage_updates(&self) -> HashMap<ContractStorageKey, StarkFelt> {
+        subtract_mappings(&self.storage_writes, &self.storage_initial_values)
+    }
+
+    fn get_class_hash_updates(&self) -> HashMap<ContractAddress, ClassHash> {
+        subtract_mappings(&self.class_hash_writes, &self.class_hash_initial_values)
+    }
 }
 
 /// Wraps a mutable reference to a `State` object, exposing its API.
@@ -297,7 +328,7 @@ impl<'a, S: State> StateReader for MutRefState<'a, S> {
         self.0.get_class_hash_at(contract_address)
     }
 
-    fn get_contract_class(&mut self, class_hash: &ClassHash) -> StateResult<ContractClass> {
+    fn get_contract_class(&mut self, class_hash: &ClassHash) -> StateResult<Arc<ContractClass>> {
         self.0.get_contract_class(class_hash)
     }
 }

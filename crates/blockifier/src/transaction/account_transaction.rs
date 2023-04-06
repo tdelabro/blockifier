@@ -1,24 +1,28 @@
-use std::mem;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::mem;
 
 use itertools::concat;
+use starknet_api::api_core::{ContractAddress, EntryPointSelector};
 use starknet_api::calldata;
-use starknet_api::core::{ContractAddress, EntryPointSelector};
+use starknet_api::deprecated_contract_class::EntryPointType;
 use starknet_api::hash::StarkFelt;
-use starknet_api::state::EntryPointType;
 use starknet_api::transaction::{
-    Calldata, DeclareTransaction, DeployAccountTransaction, Fee, InvokeTransaction,
+    Calldata, DeclareTransaction, DeployAccountTransaction, Fee, InvokeTransactionV1,
     TransactionVersion,
 };
 
 use crate::abi::abi_utils::selector_from_name;
 use crate::block_context::BlockContext;
 use crate::execution::contract_class::ContractClass;
-use crate::execution::entry_point::{CallEntryPoint, CallInfo};
+use crate::execution::entry_point::{
+    CallEntryPoint, CallInfo, CallType, ExecutionContext, ExecutionResources,
+};
 use crate::state::cached_state::TransactionalState;
 use crate::state::state_api::{State, StateReader};
 use crate::transaction::constants;
 use crate::transaction::errors::{
-    FeeTransferError, InvokeTransactionError, TransactionExecutionError,
+    FeeTransferError, TransactionExecutionError, ValidateTransactionError,
 };
 use crate::transaction::objects::{
     AccountTransactionContext, ResourcesMapping, TransactionExecutionInfo,
@@ -36,7 +40,7 @@ mod test;
 pub enum AccountTransaction {
     Declare(DeclareTransaction, ContractClass),
     DeployAccount(DeployAccountTransaction),
-    Invoke(InvokeTransaction),
+    Invoke(InvokeTransactionV1),
 }
 
 impl AccountTransaction {
@@ -53,7 +57,7 @@ impl AccountTransaction {
     // `get_tx_info()`.
     fn validate_entrypoint_calldata(&self) -> Calldata {
         match self {
-            Self::Declare(tx, _contract_class) => calldata![tx.class_hash.0],
+            Self::Declare(tx, _contract_class) => calldata![tx.class_hash().0],
             Self::DeployAccount(tx) => {
                 let validate_calldata = concat(vec![
                     vec![tx.class_hash.0, tx.contract_address_salt.0],
@@ -69,12 +73,16 @@ impl AccountTransaction {
     fn get_account_transaction_context(&self) -> AccountTransactionContext {
         match self {
             Self::Declare(tx, _contract_class) => AccountTransactionContext {
-                transaction_hash: tx.transaction_hash,
-                max_fee: tx.max_fee,
-                version: tx.version,
-                signature: tx.signature.clone(),
-                nonce: tx.nonce,
-                sender_address: tx.sender_address,
+                transaction_hash: tx.transaction_hash(),
+                max_fee: tx.max_fee(),
+                version: match tx {
+                    DeclareTransaction::V0(_) => TransactionVersion(StarkFelt::from(0)),
+                    DeclareTransaction::V1(_) => TransactionVersion(StarkFelt::from(1)),
+                    DeclareTransaction::V2(_) => TransactionVersion(StarkFelt::from(2)),
+                },
+                signature: tx.signature(),
+                nonce: tx.nonce(),
+                sender_address: tx.sender_address(),
             },
             Self::DeployAccount(tx) => AccountTransactionContext {
                 transaction_hash: tx.transaction_hash,
@@ -87,7 +95,7 @@ impl AccountTransaction {
             Self::Invoke(tx) => AccountTransactionContext {
                 transaction_hash: tx.transaction_hash,
                 max_fee: tx.max_fee,
-                version: tx.version,
+                version: TransactionVersion(StarkFelt::from(1)),
                 signature: tx.signature.clone(),
                 nonce: tx.nonce,
                 sender_address: tx.sender_address,
@@ -133,6 +141,7 @@ impl AccountTransaction {
     fn validate_tx(
         &self,
         state: &mut dyn State,
+        execution_resources: &mut ExecutionResources,
         block_context: &BlockContext,
         account_tx_context: &AccountTransactionContext,
     ) -> TransactionExecutionResult<Option<CallInfo>> {
@@ -147,8 +156,19 @@ impl AccountTransaction {
             class_hash: None,
             storage_address: account_tx_context.sender_address,
             caller_address: ContractAddress::default(),
+            call_type: CallType::Call,
         };
-        let validate_call_info = validate_call.execute(state, block_context, account_tx_context)?;
+        let mut execution_context = ExecutionContext::default();
+
+        let validate_call_info = validate_call
+            .execute(
+                state,
+                execution_resources,
+                &mut execution_context,
+                block_context,
+                account_tx_context,
+            )
+            .map_err(ValidateTransactionError::ValidateExecutionFailed)?;
         verify_no_calls_to_other_contracts(
             &validate_call_info,
             String::from(constants::VALIDATE_ENTRY_POINT_NAME),
@@ -169,14 +189,20 @@ impl AccountTransaction {
         }
 
         let actual_fee = calculate_tx_fee(block_context);
-        let fee_transfer_call_info =
-            Self::execute_fee_transfer(state, block_context, account_tx_context, actual_fee)?;
+        let fee_transfer_call_info = Self::execute_fee_transfer(
+            state,
+            &mut ExecutionResources::default(),
+            block_context,
+            account_tx_context,
+            actual_fee,
+        )?;
 
         Ok((actual_fee, Some(fee_transfer_call_info)))
     }
 
     fn execute_fee_transfer(
         state: &mut dyn State,
+        execution_resources: &mut ExecutionResources,
         block_context: &BlockContext,
         account_tx_context: &AccountTransactionContext,
         actual_fee: Fee,
@@ -202,9 +228,17 @@ impl AccountTransaction {
             ],
             storage_address: block_context.fee_token_address,
             caller_address: account_tx_context.sender_address,
+            call_type: CallType::Call,
         };
+        let mut execution_context = ExecutionContext::default();
 
-        Ok(fee_transfer_call.execute(state, block_context, account_tx_context)?)
+        Ok(fee_transfer_call.execute(
+            state,
+            execution_resources,
+            &mut execution_context,
+            block_context,
+            account_tx_context,
+        )?)
     }
 }
 
@@ -221,43 +255,71 @@ impl<S: StateReader> ExecutableTransaction<S> for AccountTransaction {
         // Handle transaction-type specific execution.
         let validate_call_info: Option<CallInfo>;
         let execute_call_info: Option<CallInfo>;
+        let execution_resources = &mut ExecutionResources::default();
         match self {
             Self::Declare(ref tx, ref mut contract_class) => {
                 let contract_class = Some(mem::take(contract_class));
 
                 // Validate.
-                validate_call_info = self.validate_tx(state, block_context, &account_tx_context)?;
+                validate_call_info = self.validate_tx(
+                    state,
+                    execution_resources,
+                    block_context,
+                    &account_tx_context,
+                )?;
 
                 // Execute.
-                execute_call_info =
-                    tx.run_execute(state, block_context, &account_tx_context, contract_class)?;
+                execute_call_info = tx.run_execute(
+                    state,
+                    execution_resources,
+                    block_context,
+                    &account_tx_context,
+                    contract_class,
+                )?;
             }
             Self::DeployAccount(ref tx) => {
                 // Execute the constructor of the deployed class.
-                execute_call_info =
-                    tx.run_execute(state, block_context, &account_tx_context, None)?;
+                execute_call_info = tx.run_execute(
+                    state,
+                    execution_resources,
+                    block_context,
+                    &account_tx_context,
+                    None,
+                )?;
 
                 // Validate.
-                validate_call_info = self.validate_tx(state, block_context, &account_tx_context)?;
+                validate_call_info = self.validate_tx(
+                    state,
+                    execution_resources,
+                    block_context,
+                    &account_tx_context,
+                )?;
             }
             Self::Invoke(ref tx) => {
-                // Specifying an entry point selector is not allowed; `__execute__` is called, and
-                // the inner selector appears in the calldata.
-                if tx.entry_point_selector.is_some() {
-                    return Err(InvokeTransactionError::SpecifiedEntryPoint)?;
-                }
-
                 // Validate.
-                validate_call_info = self.validate_tx(state, block_context, &account_tx_context)?;
+                validate_call_info = self.validate_tx(
+                    state,
+                    execution_resources,
+                    block_context,
+                    &account_tx_context,
+                )?;
 
                 // Execute.
-                execute_call_info =
-                    tx.run_execute(state, block_context, &account_tx_context, None)?;
+                execute_call_info = tx.run_execute(
+                    state,
+                    execution_resources,
+                    block_context,
+                    &account_tx_context,
+                    None,
+                )?;
             }
         };
 
         // Charge fee.
         let actual_resources = ResourcesMapping::default();
+        let (n_storage_updates, n_modified_contracts, n_class_updates) =
+            state.count_actual_state_changes();
+
         let (actual_fee, fee_transfer_call_info) =
             Self::charge_fee(state, block_context, &account_tx_context)?;
 
@@ -267,6 +329,9 @@ impl<S: StateReader> ExecutableTransaction<S> for AccountTransaction {
             fee_transfer_call_info,
             actual_fee,
             actual_resources,
+            n_storage_updates,
+            n_modified_contracts,
+            n_class_updates,
         };
         Ok(tx_execution_info)
     }

@@ -1,23 +1,27 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use alloc::string::ToString;
+use alloc::sync::Arc;
 
 use assert_matches::assert_matches;
+use cairo_vm::vm::runners::builtin_runner::{HASH_BUILTIN_NAME, RANGE_CHECK_BUILTIN_NAME};
+use cairo_vm::vm::runners::cairo_runner::ExecutionResources as VmExecutionResources;
 use itertools::concat;
 use pretty_assertions::assert_eq;
-use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector, Nonce, PatriciaKey};
+use starknet_api::api_core::{ClassHash, ContractAddress, Nonce, PatriciaKey};
+use starknet_api::deprecated_contract_class::EntryPointType;
 use starknet_api::hash::{StarkFelt, StarkHash};
-use starknet_api::state::{EntryPointType, StorageKey};
+use starknet_api::state::StorageKey;
 use starknet_api::transaction::{
-    Calldata, DeclareTransaction, DeployAccountTransaction, EventContent, EventData, EventKey, Fee,
-    InvokeTransaction, TransactionVersion,
+    Calldata, DeclareTransaction, DeclareTransactionV0V1, DeployAccountTransaction, EventContent,
+    EventData, EventKey, Fee, InvokeTransactionV1,
 };
 use starknet_api::{calldata, patricia_key, stark_felt};
 
 use crate::abi::abi_utils::{get_storage_var_address, selector_from_name};
 use crate::abi::constants as abi_constants;
 use crate::block_context::BlockContext;
+use crate::collections::HashMap;
 use crate::execution::entry_point::{
-    CallEntryPoint, CallExecution, CallInfo, OrderedEvent, Retdata,
+    CallEntryPoint, CallExecution, CallInfo, CallType, OrderedEvent, Retdata,
 };
 use crate::retdata;
 use crate::state::cached_state::CachedState;
@@ -32,9 +36,7 @@ use crate::test_utils::{
 };
 use crate::transaction::account_transaction::AccountTransaction;
 use crate::transaction::constants;
-use crate::transaction::errors::{
-    FeeTransferError, InvokeTransactionError, TransactionExecutionError,
-};
+use crate::transaction::errors::{FeeTransferError, TransactionExecutionError};
 use crate::transaction::objects::{ResourcesMapping, TransactionExecutionInfo};
 use crate::transaction::transactions::ExecutableTransaction;
 
@@ -60,7 +62,7 @@ fn create_account_tx_test_state() -> CachedState<DictStateReader> {
         (test_erc20_address, test_erc20_class_hash),
     ]);
     let storage_view = HashMap::from([(
-        (test_erc20_address, *TEST_ERC20_ACCOUNT_BALANCE_KEY),
+        (test_erc20_address, TEST_ERC20_ACCOUNT_BALANCE_KEY),
         stark_felt!(actual_fee().0 as u64),
     )]);
     CachedState::new(DictStateReader {
@@ -81,6 +83,18 @@ fn expected_validate_call_info(
     calldata: Calldata,
     storage_address: ContractAddress,
 ) -> Option<CallInfo> {
+    // Extra range check in regular (invoke) validate call, due to passing the calldata as an array.
+    let n_range_checks =
+        usize::from(entry_point_selector_name == constants::VALIDATE_ENTRY_POINT_NAME);
+    let vm_resources = VmExecutionResources {
+        n_steps: 21,
+        n_memory_holes: 1,
+        builtin_instance_counter: HashMap::from([(
+            RANGE_CHECK_BUILTIN_NAME.to_string(),
+            n_range_checks,
+        )]),
+    };
+
     Some(CallInfo {
         call: CallEntryPoint {
             class_hash: Some(class_hash),
@@ -89,9 +103,11 @@ fn expected_validate_call_info(
             calldata,
             storage_address,
             caller_address: ContractAddress::default(),
+            call_type: CallType::Call,
         },
         // The account contract we use for testing has trivial `validate` functions.
         execution: CallExecution::default(),
+        vm_resources,
         ..Default::default()
     })
 }
@@ -100,6 +116,7 @@ fn expected_fee_transfer_call_info(
     block_context: &BlockContext,
     account_address: ContractAddress,
     actual_fee: Fee,
+    vm_resources: VmExecutionResources,
 ) -> Option<CallInfo> {
     let expected_fee_token_class_hash = ClassHash(stark_felt!(TEST_ERC20_CONTRACT_CLASS_HASH));
     let expected_sequencer_address = *block_context.sequencer_address.0.key();
@@ -118,6 +135,7 @@ fn expected_fee_transfer_call_info(
         ],
         storage_address: block_context.fee_token_address,
         caller_address: account_address,
+        call_type: CallType::Call,
     };
     let expected_fee_sender_address = *account_address.0.key();
     let expected_fee_transfer_event = OrderedEvent {
@@ -132,6 +150,7 @@ fn expected_fee_transfer_call_info(
             ]),
         },
     };
+
     Some(CallInfo {
         call: expected_fee_transfer_call,
         execution: CallExecution {
@@ -139,6 +158,7 @@ fn expected_fee_transfer_call_info(
             events: vec![expected_fee_transfer_event],
             ..Default::default()
         },
+        vm_resources,
         ..Default::default()
     })
 }
@@ -158,13 +178,13 @@ fn validate_final_balances(
 
     assert_eq!(
         state
-            .get_storage_at(block_context.fee_token_address, *TEST_ERC20_SEQUENCER_BALANCE_KEY)
+            .get_storage_at(block_context.fee_token_address, TEST_ERC20_SEQUENCER_BALANCE_KEY)
             .unwrap(),
         stark_felt!(expected_sequencer_balance)
     );
 }
 
-fn invoke_tx() -> InvokeTransaction {
+fn invoke_tx() -> InvokeTransactionV1 {
     let entry_point_selector = selector_from_name("return_result");
     let execute_calldata = calldata![
         stark_felt!(TEST_CONTRACT_ADDRESS), // Contract address.
@@ -213,6 +233,7 @@ fn test_invoke_tx() {
         calldata: Calldata(expected_return_result_calldata.clone().into()),
         storage_address: ContractAddress(patricia_key!(TEST_CONTRACT_ADDRESS)),
         caller_address: expected_account_address,
+        call_type: CallType::Call,
     };
     let expected_execute_call = CallEntryPoint {
         entry_point_selector: selector_from_name(constants::EXECUTE_ENTRY_POINT_NAME),
@@ -222,9 +243,19 @@ fn test_invoke_tx() {
     let expected_execute_call_info = Some(CallInfo {
         call: expected_execute_call,
         execution: CallExecution::from_retdata(Retdata(expected_return_result_retdata.0.clone())),
+        vm_resources: VmExecutionResources {
+            n_steps: 39,
+            n_memory_holes: 1,
+            builtin_instance_counter: HashMap::from([(RANGE_CHECK_BUILTIN_NAME.to_string(), 1)]),
+        },
         inner_calls: vec![CallInfo {
             call: expected_return_result_call,
             execution: CallExecution::from_retdata(expected_return_result_retdata),
+            vm_resources: VmExecutionResources {
+                n_steps: 22,
+                n_memory_holes: 1,
+                ..Default::default()
+            },
             ..Default::default()
         }],
         ..Default::default()
@@ -236,6 +267,14 @@ fn test_invoke_tx() {
         block_context,
         expected_account_address,
         expected_actual_fee,
+        VmExecutionResources {
+            n_steps: 525,
+            n_memory_holes: 60,
+            builtin_instance_counter: HashMap::from([
+                (HASH_BUILTIN_NAME.to_string(), 4),
+                (RANGE_CHECK_BUILTIN_NAME.to_string(), 21),
+            ]),
+        },
     );
 
     let expected_execution_info = TransactionExecutionInfo {
@@ -244,6 +283,9 @@ fn test_invoke_tx() {
         fee_transfer_call_info: expected_fee_transfer_call_info,
         actual_fee: expected_actual_fee,
         actual_resources: ResourcesMapping::default(),
+        n_storage_updates: 0,
+        n_modified_contracts: 0,
+        n_class_updates: 0,
     };
 
     // Test execution info result.
@@ -259,7 +301,7 @@ fn test_invoke_tx() {
         state,
         block_context,
         expected_sequencer_balance,
-        *TEST_ERC20_ACCOUNT_BALANCE_KEY,
+        TEST_ERC20_ACCOUNT_BALANCE_KEY,
     );
 }
 
@@ -269,26 +311,9 @@ fn test_negative_invoke_tx_flows() {
     let block_context = &BlockContext::create_for_testing();
     let valid_invoke_tx = invoke_tx();
 
-    // Invalid version.
-    // Note: there is no need to test for a negative version, as it cannot be constructed.
-    let invalid_tx_version = TransactionVersion(stark_felt!(0));
-    let invalid_tx = AccountTransaction::Invoke(InvokeTransaction {
-        version: invalid_tx_version,
-        ..valid_invoke_tx.clone()
-    });
-    let execution_error = invalid_tx.execute(state, block_context).unwrap_err();
-
-    // Test error.
-    let expected_allowed_versions = vec![TransactionVersion(stark_felt!(1))];
-    assert_matches!(
-        execution_error,
-        TransactionExecutionError::InvalidVersion { version, allowed_versions }
-        if (version, &allowed_versions) == (invalid_tx_version, &expected_allowed_versions)
-    );
-
     // Insufficient fee.
     let invalid_max_fee = Fee(1);
-    let invalid_tx = AccountTransaction::Invoke(InvokeTransaction {
+    let invalid_tx = AccountTransaction::Invoke(InvokeTransactionV1 {
         max_fee: invalid_max_fee,
         ..valid_invoke_tx.clone()
     });
@@ -305,28 +330,11 @@ fn test_negative_invoke_tx_flows() {
         if (max_fee, actual_fee) == (invalid_max_fee, expected_actual_fee)
     );
 
-    // Invalid selector.
-    let invalid_selector = Some(EntryPointSelector::default());
-    let invalid_tx = AccountTransaction::Invoke(InvokeTransaction {
-        entry_point_selector: invalid_selector,
-        ..valid_invoke_tx.clone()
-    });
-    let execution_error =
-        invalid_tx.execute(&mut create_account_tx_test_state(), block_context).unwrap_err();
-
-    // Test error.
-    assert_matches!(
-        execution_error,
-        TransactionExecutionError::InvokeTransactionError(
-            InvokeTransactionError::SpecifiedEntryPoint
-        )
-    );
-
     // Invalid nonce.
     // Use a fresh state to facilitate testing.
     let invalid_nonce = Nonce(stark_felt!(1));
     let invalid_tx =
-        AccountTransaction::Invoke(InvokeTransaction { nonce: invalid_nonce, ..valid_invoke_tx });
+        AccountTransaction::Invoke(InvokeTransactionV1 { nonce: invalid_nonce, ..valid_invoke_tx });
     let execution_error =
         invalid_tx.execute(&mut create_account_tx_test_state(), block_context).unwrap_err();
 
@@ -338,7 +346,7 @@ fn test_negative_invoke_tx_flows() {
     );
 }
 
-fn declare_tx() -> DeclareTransaction {
+fn declare_tx() -> DeclareTransactionV0V1 {
     crate::test_utils::declare_tx(
         TEST_EMPTY_CONTRACT_CLASS_HASH,
         ContractAddress(patricia_key!(TEST_ACCOUNT_CONTRACT_ADDRESS)),
@@ -358,7 +366,10 @@ fn test_declare_tx() {
     let class_hash = declare_tx.class_hash;
 
     let contract_class = get_contract_class(TEST_EMPTY_CONTRACT_PATH);
-    let account_tx = AccountTransaction::Declare(declare_tx.clone(), contract_class.clone());
+    let account_tx = AccountTransaction::Declare(
+        DeclareTransaction::V1(declare_tx.clone()),
+        contract_class.clone(),
+    );
 
     // Check state before transaction application.
     assert_matches!(
@@ -384,6 +395,14 @@ fn test_declare_tx() {
         block_context,
         expected_account_address,
         expected_actual_fee,
+        VmExecutionResources {
+            n_steps: 525,
+            n_memory_holes: 60,
+            builtin_instance_counter: HashMap::from([
+                (RANGE_CHECK_BUILTIN_NAME.to_string(), 21),
+                (HASH_BUILTIN_NAME.to_string(), 4),
+            ]),
+        },
     );
 
     let expected_execution_info = TransactionExecutionInfo {
@@ -392,6 +411,9 @@ fn test_declare_tx() {
         fee_transfer_call_info: expected_fee_transfer_call_info,
         actual_fee: expected_actual_fee,
         actual_resources: ResourcesMapping::default(),
+        n_storage_updates: 0,
+        n_modified_contracts: 0,
+        n_class_updates: 0,
     };
 
     // Test execution info result.
@@ -407,16 +429,16 @@ fn test_declare_tx() {
         state,
         block_context,
         expected_sequencer_balance,
-        *TEST_ERC20_ACCOUNT_BALANCE_KEY,
+        TEST_ERC20_ACCOUNT_BALANCE_KEY,
     );
 
     // Verify class declaration.
     let contract_class_from_state = state.get_contract_class(&class_hash).unwrap();
-    assert_eq!(contract_class_from_state, contract_class);
+    assert_eq!(contract_class_from_state, Arc::from(contract_class.clone()));
 
     // Negative flow: check that the same class hash cannot be declared twice.
-    let invalid_declare_tx = AccountTransaction::Declare(
-        DeclareTransaction { nonce: Nonce(stark_felt!(1)), ..declare_tx },
+    let invalid_declare_tx = AccountTransaction::create_declare_tx_v1(
+        DeclareTransactionV0V1 { nonce: Nonce(stark_felt!(1)), ..declare_tx },
         contract_class,
     );
     let error = invalid_declare_tx.execute(state, block_context).unwrap_err();
@@ -482,6 +504,14 @@ fn test_deploy_account_tx() {
         block_context,
         deployed_account_address,
         expected_actual_fee,
+        VmExecutionResources {
+            n_steps: 525,
+            n_memory_holes: 58,
+            builtin_instance_counter: HashMap::from([
+                (HASH_BUILTIN_NAME.to_string(), 4),
+                (RANGE_CHECK_BUILTIN_NAME.to_string(), 21),
+            ]),
+        },
     );
 
     let expected_execution_info = TransactionExecutionInfo {
@@ -490,6 +520,9 @@ fn test_deploy_account_tx() {
         fee_transfer_call_info: expected_fee_transfer_call_info,
         actual_fee: expected_actual_fee,
         actual_resources: ResourcesMapping::default(),
+        n_storage_updates: 0,
+        n_modified_contracts: 1,
+        n_class_updates: 1,
     };
 
     // Test execution info result.

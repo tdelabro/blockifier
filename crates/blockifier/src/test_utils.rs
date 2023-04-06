@@ -1,30 +1,33 @@
-use std::collections::HashMap;
-use std::iter::zip;
-use std::path::PathBuf;
+use alloc::string::ToString;
+use alloc::sync::Arc;
+use core::iter::zip;
 
-use once_cell::sync::Lazy;
-use starknet_api::block::{BlockNumber, BlockTimestamp};
-use starknet_api::core::{
+use starknet_api::api_core::{
     calculate_contract_address, ChainId, ClassHash, ContractAddress, EntryPointSelector, Nonce,
     PatriciaKey,
 };
+use starknet_api::block::{BlockNumber, BlockTimestamp};
+use starknet_api::deprecated_contract_class::EntryPointType;
 use starknet_api::hash::{StarkFelt, StarkHash};
-use starknet_api::state::{EntryPointType, StorageKey};
+use starknet_api::state::StorageKey;
 use starknet_api::transaction::{
-    Calldata, ContractAddressSalt, DeclareTransaction, DeployAccountTransaction, Fee,
-    InvokeTransaction, TransactionVersion,
+    Calldata, ContractAddressSalt, DeclareTransaction, DeclareTransactionV0V1,
+    DeployAccountTransaction, Fee, InvokeTransactionV1, TransactionVersion,
 };
 use starknet_api::{calldata, patricia_key, stark_felt};
 
 use crate::abi::abi_utils::get_storage_var_address;
 use crate::block_context::BlockContext;
+use crate::collections::HashMap;
 use crate::execution::contract_class::ContractClass;
 use crate::execution::entry_point::{
-    CallEntryPoint, CallExecution, CallInfo, EntryPointExecutionResult, Retdata,
+    CallEntryPoint, CallExecution, CallInfo, CallType, EntryPointExecutionResult, ExecutionContext,
+    ExecutionResources, Retdata,
 };
-use crate::state::cached_state::{CachedState, ContractClassMapping, ContractStorageKey};
+use crate::state::cached_state::{CachedState, ContractStorageKey};
 use crate::state::errors::StateError;
 use crate::state::state_api::{State, StateReader, StateResult};
+use crate::transaction::account_transaction::AccountTransaction;
 use crate::transaction::objects::{AccountTransactionContext, TransactionExecutionInfo};
 
 // Addresses.
@@ -42,47 +45,50 @@ pub const TEST_EMPTY_CONTRACT_CLASS_HASH: &str = "0x112";
 pub const TEST_ERC20_CONTRACT_CLASS_HASH: &str = "0x1010";
 
 // Paths.
-pub const ACCOUNT_CONTRACT_PATH: &str =
-    "./feature_contracts/compiled/account_without_validations_compiled.json";
-pub const TEST_CONTRACT_PATH: &str = "./feature_contracts/compiled/test_contract_compiled.json";
-pub const SECURITY_TEST_CONTRACT_PATH: &str =
-    "./feature_contracts/compiled/security_tests_contract_compiled.json";
-pub const TEST_EMPTY_CONTRACT_PATH: &str =
-    "./feature_contracts/compiled/empty_contract_compiled.json";
-pub const ERC20_CONTRACT_PATH: &str =
-    "./ERC20_without_some_syscalls/ERC20/erc20_contract_without_some_syscalls_compiled.json";
-
-// Selectors.
-pub const WITHOUT_ARG_SELECTOR: &str =
-    "0x382a967a31be13f23e23a5345f7a89b0362cc157d6fbe7564e6396a83cf4b4f";
-pub const WITH_ARG_SELECTOR: &str =
-    "0xe7def693d16806ca2a2f398d8de5951344663ba77f340ed7a958da731872fc";
-pub const BITWISE_AND_SELECTOR: &str =
-    "0xad451bd0dba3d8d97104e1bfc474f88605ccc7acbe1c846839a120fdf30d95";
-pub const SQRT_SELECTOR: &str = "0x137a07fa9c479e27114b8ae1fbf252f2065cf91a0d8615272e060a7ccf37309";
-pub const RETURN_RESULT_SELECTOR: &str =
-    "0x39a1491f76903a16feed0a6433bec78de4c73194944e1118e226820ad479701";
-pub const TEST_STORAGE_READ_WRITE_SELECTOR: &str =
-    "0x3b097c62d3e4b85742aadd0dfb823f96134b886ec13bda57b68faf86f294d97";
-pub const TEST_LIBRARY_CALL_SELECTOR: &str =
-    "0x3604cea1cdb094a73a31144f14a3e5861613c008e1e879939ebc4827d10cd50";
-pub const TEST_NESTED_LIBRARY_CALL_SELECTOR: &str =
-    "0x3a6a8bae4c51d5959683ae246347ffdd96aa5b2bfa68cc8c3a6a7c2ed0be331";
-pub const TEST_CALL_CONTRACT_SELECTOR: &str =
-    "0x27c3334165536f239cfd400ed956eabff55fc60de4fb56728b6a4f6b87db01c";
-pub const TEST_DEPLOY_SELECTOR: &str =
-    "0x169f135eddda5ab51886052d777a57f2ea9c162d713691b5e04a6d4ed71d47f";
-pub const TEST_STORAGE_VAR_SELECTOR: &str =
-    "0x36fa6de2810d05c3e1a0ebe23f60b9c2f4629bbead09e5a9704e1c5632630d5";
+pub const ACCOUNT_CONTRACT_PATH: &[u8] =
+    include_bytes!("../feature_contracts/compiled/account_without_validations_compiled.json");
+pub const TEST_CONTRACT_PATH: &[u8] =
+    include_bytes!("../feature_contracts/compiled/test_contract_compiled.json");
+pub const SECURITY_TEST_CONTRACT_PATH: &[u8] =
+    include_bytes!("../feature_contracts/compiled/security_tests_contract_compiled.json");
+pub const TEST_EMPTY_CONTRACT_PATH: &[u8] =
+    include_bytes!("../feature_contracts/compiled/empty_contract_compiled.json");
+pub const ERC20_CONTRACT_PATH: &[u8] = include_bytes!(
+    "../ERC20_without_some_syscalls/ERC20/erc20_contract_without_some_syscalls_compiled.json"
+);
 
 // Storage keys.
-pub static TEST_ERC20_SEQUENCER_BALANCE_KEY: Lazy<StorageKey> = Lazy::new(|| {
-    get_storage_var_address("ERC20_balances", &[stark_felt!(TEST_SEQUENCER_ADDRESS)]).unwrap()
-});
-pub static TEST_ERC20_ACCOUNT_BALANCE_KEY: Lazy<StorageKey> = Lazy::new(|| {
-    get_storage_var_address("ERC20_balances", &[stark_felt!(TEST_ACCOUNT_CONTRACT_ADDRESS)])
-        .unwrap()
-});
+pub const TEST_ERC20_SEQUENCER_BALANCE_KEY: StorageKey = unsafe {
+    core::mem::transmute([
+        0x07u8, 0x23, 0x97, 0x32, 0x08, 0x63, 0x9b, 0x78, 0x39, 0xce, 0x29, 0x8f, 0x7f, 0xfe, 0xa6,
+        0x1e, 0x3f, 0x95, 0x33, 0x87, 0x2d, 0xef, 0xd7, 0xab, 0xdb, 0x91, 0x02, 0x3d, 0xb4, 0x65,
+        0x88, 0x12,
+    ])
+};
+pub const TEST_ERC20_ACCOUNT_BALANCE_KEY: StorageKey = unsafe {
+    core::mem::transmute([
+        0x02u8, 0xa2, 0xc4, 0x9c, 0x4d, 0xba, 0x0d, 0x91, 0xb3, 0x4f, 0x2a, 0xde, 0x85, 0xd4, 0x1d,
+        0x09, 0x56, 0x1f, 0x9a, 0x77, 0x88, 0x4c, 0x15, 0xba, 0x2a, 0xb0, 0xf2, 0x24, 0x1b, 0x08,
+        0x0d, 0xeb,
+    ])
+};
+#[test]
+fn ensure_test_erc20_sequencer_balance_key_is_correct() {
+    assert_eq!(
+        get_storage_var_address("ERC20_balances", &[stark_felt!(TEST_SEQUENCER_ADDRESS)]).unwrap(),
+        TEST_ERC20_SEQUENCER_BALANCE_KEY
+    )
+}
+#[test]
+fn ensure_test_erc20_account_balance_key_is_correct() {
+    assert_eq!(
+        get_storage_var_address("ERC20_balances", &[stark_felt!(TEST_ACCOUNT_CONTRACT_ADDRESS)])
+            .unwrap(),
+        TEST_ERC20_ACCOUNT_BALANCE_KEY
+    )
+}
+
+pub const DEFAULT_GAS_PRICE: u128 = 100 * u128::pow(10, 9); // Given in units of wei.
 
 /// A simple implementation of `StateReader` using `HashMap`s as storage.
 #[derive(Debug, Default)]
@@ -90,7 +96,7 @@ pub struct DictStateReader {
     pub storage_view: HashMap<ContractStorageKey, StarkFelt>,
     pub address_to_nonce: HashMap<ContractAddress, Nonce>,
     pub address_to_class_hash: HashMap<ContractAddress, ClassHash>,
-    pub class_hash_to_class: ContractClassMapping,
+    pub class_hash_to_class: HashMap<ClassHash, ContractClass>,
 }
 
 impl StateReader for DictStateReader {
@@ -109,10 +115,10 @@ impl StateReader for DictStateReader {
         Ok(nonce)
     }
 
-    fn get_contract_class(&mut self, class_hash: &ClassHash) -> StateResult<ContractClass> {
+    fn get_contract_class(&mut self, class_hash: &ClassHash) -> StateResult<Arc<ContractClass>> {
         let contract_class = self.class_hash_to_class.get(class_hash).cloned();
         match contract_class {
-            Some(contract_class) => Ok(contract_class),
+            Some(contract_class) => Ok(Arc::from(contract_class)),
             None => Err(StateError::UndeclaredClassHash(*class_hash)),
         }
     }
@@ -124,9 +130,10 @@ impl StateReader for DictStateReader {
     }
 }
 
-pub fn get_contract_class(contract_path: &str) -> ContractClass {
-    let path = PathBuf::from(contract_path);
-    ContractClass::try_from(path).expect("File must contain the content of a compiled contract.")
+pub fn get_contract_class(contract_content: &'static [u8]) -> ContractClass {
+    let raw_contract_class = serde_json::from_slice(contract_content)
+        .expect("File must contain the content of a compiled contract.");
+    raw_contract_class
 }
 
 pub fn get_test_contract_class() -> ContractClass {
@@ -141,12 +148,13 @@ pub fn trivial_external_entry_point() -> CallEntryPoint {
         calldata: calldata![],
         storage_address: ContractAddress(patricia_key!(TEST_CONTRACT_ADDRESS)),
         caller_address: ContractAddress::default(),
+        call_type: CallType::Call,
     }
 }
 
 pub fn create_test_state_util(
     class_hash: &str,
-    contract_path: &str,
+    contract_path: &'static [u8],
     contract_address: &str,
 ) -> CachedState<DictStateReader> {
     let class_hash_to_class =
@@ -155,6 +163,7 @@ pub fn create_test_state_util(
         ContractAddress(patricia_key!(contract_address)),
         ClassHash(stark_felt!(class_hash)),
     )]);
+
     CachedState::new(DictStateReader {
         class_hash_to_class,
         address_to_class_hash,
@@ -190,6 +199,7 @@ pub fn create_deploy_test_state() -> CachedState<DictStateReader> {
     ]);
     let address_to_class_hash =
         HashMap::from([(contract_address, class_hash), (another_contract_address, class_hash)]);
+
     CachedState::new(DictStateReader {
         class_hash_to_class,
         address_to_class_hash,
@@ -202,6 +212,8 @@ impl CallEntryPoint {
     pub fn execute_directly(self, state: &mut dyn State) -> EntryPointExecutionResult<CallInfo> {
         self.execute(
             state,
+            &mut ExecutionResources::default(),
+            &mut ExecutionContext::default(),
             &BlockContext::create_for_testing(),
             &AccountTransactionContext::default(),
         )
@@ -217,6 +229,7 @@ impl BlockContext {
             sequencer_address: ContractAddress(patricia_key!(TEST_SEQUENCER_ADDRESS)),
             fee_token_address: ContractAddress(patricia_key!(TEST_ERC20_CONTRACT_ADDRESS)),
             cairo_resource_fee_weights: HashMap::default(),
+            gas_price: DEFAULT_GAS_PRICE,
             invoke_tx_max_n_steps: 1_000_000,
             validate_max_n_steps: 1_000_000,
         }
@@ -226,6 +239,15 @@ impl BlockContext {
 impl CallExecution {
     pub fn from_retdata(retdata: Retdata) -> Self {
         Self { retdata, ..Default::default() }
+    }
+}
+
+impl AccountTransaction {
+    pub fn create_declare_tx_v1(
+        declare_tx: DeclareTransactionV0V1,
+        contract_class: ContractClass,
+    ) -> AccountTransaction {
+        AccountTransaction::Declare(DeclareTransaction::V1(declare_tx), contract_class)
     }
 }
 
@@ -256,24 +278,17 @@ pub fn invoke_tx(
     calldata: Calldata,
     sender_address: ContractAddress,
     max_fee: Fee,
-) -> InvokeTransaction {
-    InvokeTransaction {
-        max_fee,
-        version: TransactionVersion(stark_felt!(1)),
-        sender_address,
-        calldata,
-        ..Default::default()
-    }
+) -> InvokeTransactionV1 {
+    InvokeTransactionV1 { max_fee, sender_address, calldata, ..Default::default() }
 }
 
 pub fn declare_tx(
     class_hash: &str,
     sender_address: ContractAddress,
     max_fee: Fee,
-) -> DeclareTransaction {
-    DeclareTransaction {
+) -> DeclareTransactionV0V1 {
+    DeclareTransactionV0V1 {
         max_fee,
-        version: TransactionVersion(StarkFelt::from(1)),
         class_hash: ClassHash(stark_felt!(class_hash)),
         sender_address,
         ..Default::default()
@@ -313,4 +328,7 @@ pub fn validate_tx_execution_info(
     compare_optional_call_infos(actual.fee_transfer_call_info, expected.fee_transfer_call_info);
     assert_eq!(actual.actual_fee, expected.actual_fee);
     assert_eq!(actual.actual_resources, expected.actual_resources);
+    assert_eq!(actual.n_storage_updates, expected.n_storage_updates);
+    assert_eq!(actual.n_modified_contracts, expected.n_modified_contracts);
+    assert_eq!(actual.n_class_updates, expected.n_class_updates);
 }
