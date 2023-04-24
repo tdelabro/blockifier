@@ -1,5 +1,7 @@
-use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::any::Any;
 
 use cairo_felt::Felt252;
 use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_definition::{
@@ -12,12 +14,13 @@ use cairo_vm::types::exec_scope::ExecutionScopes;
 use cairo_vm::types::relocatable::{MaybeRelocatable, Relocatable};
 use cairo_vm::vm::errors::hint_errors::HintError;
 use cairo_vm::vm::vm_core::VirtualMachine;
-use starknet_api::core::{ContractAddress, EntryPointSelector};
+use starknet_api::api_core::{ContractAddress, EntryPointSelector};
 use starknet_api::hash::StarkFelt;
 use starknet_api::state::StorageKey;
 use starknet_api::transaction::Calldata;
 
 use crate::block_context::BlockContext;
+use crate::collections::{HashMap, HashSet};
 use crate::execution::common_hints::{extended_builtin_hint_processor, HintExecutionResult};
 use crate::execution::entry_point::{
     CallEntryPoint, CallInfo, ExecutionContext, ExecutionResources, OrderedEvent,

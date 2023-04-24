@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use alloc::string::String;
+use alloc::sync::Arc;
 
-use starknet_api::core::ContractAddress;
+use starknet_api::api_core::ContractAddress;
 use starknet_api::deprecated_contract_class::EntryPointType;
 use starknet_api::transaction::{
     Calldata, DeclareTransaction, DeployAccountTransaction, InvokeTransactionV1,

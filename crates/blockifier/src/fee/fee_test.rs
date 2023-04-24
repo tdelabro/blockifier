@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use alloc::string::String;
 
 use assert_matches::assert_matches;
 
 use crate::block_context::BlockContext;
+use crate::collections::HashMap;
 use crate::fee::fee_utils::calculate_l1_gas_by_vm_usage;
 use crate::transaction::errors::TransactionExecutionError;
 use crate::transaction::objects::ResourcesMapping;

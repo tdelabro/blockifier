@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use alloc::string::ToString;
+use alloc::vec::Vec;
 
 use cairo_vm::types::errors::program_errors::ProgramError;
 use cairo_vm::types::program::Program;
@@ -9,6 +10,7 @@ use starknet_api::deprecated_contract_class::{
     Program as DeprecatedProgram,
 };
 
+use crate::collections::HashMap;
 use crate::execution::execution_utils::sn_api_to_cairo_vm_program;
 
 /// Represents a runnable StarkNet contract class (meaning, the program is runnable by the VM).

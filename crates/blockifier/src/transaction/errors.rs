@@ -1,7 +1,10 @@
-use starknet_api::core::{ClassHash, ContractAddress, Nonce};
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use starknet_api::api_core::{ClassHash, ContractAddress, Nonce};
 use starknet_api::transaction::{Fee, TransactionVersion};
 use starknet_api::StarknetApiError;
-use thiserror::Error;
+use thiserror_no_std::Error;
 
 use crate::execution::errors::EntryPointExecutionError;
 use crate::state::errors::StateError;

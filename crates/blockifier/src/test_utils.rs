@@ -1,14 +1,12 @@
-use std::collections::HashMap;
-use std::fs;
-use std::iter::zip;
-use std::path::PathBuf;
-use std::sync::Arc;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use core::iter::zip;
 
-use starknet_api::block::{BlockNumber, BlockTimestamp};
-use starknet_api::core::{
+use starknet_api::api_core::{
     calculate_contract_address, ChainId, ClassHash, ContractAddress, EntryPointSelector, Nonce,
     PatriciaKey,
 };
+use starknet_api::block::{BlockNumber, BlockTimestamp};
 use starknet_api::deprecated_contract_class::{
     ContractClass as DeprecatedContractClass, EntryPointType,
 };
@@ -22,6 +20,7 @@ use starknet_api::{calldata, patricia_key, stark_felt};
 
 use crate::abi::abi_utils::get_storage_var_address;
 use crate::block_context::BlockContext;
+use crate::collections::HashMap;
 use crate::execution::contract_class::ContractClass;
 use crate::execution::entry_point::{
     CallEntryPoint, CallExecution, CallInfo, CallType, EntryPointExecutionResult, ExecutionContext,
@@ -52,17 +51,19 @@ pub const SECURITY_TEST_CLASS_HASH: &str = "0x114";
 pub const TEST_ERC20_CONTRACT_CLASS_HASH: &str = "0x1010";
 
 // Paths.
-pub const ACCOUNT_CONTRACT_PATH: &str =
-    "./feature_contracts/compiled/account_without_validations_compiled.json";
-pub const TEST_CONTRACT_PATH: &str = "./feature_contracts/compiled/test_contract_compiled.json";
-pub const SECURITY_TEST_CONTRACT_PATH: &str =
-    "./feature_contracts/compiled/security_tests_contract_compiled.json";
-pub const TEST_EMPTY_CONTRACT_PATH: &str =
-    "./feature_contracts/compiled/empty_contract_compiled.json";
-pub const TEST_FAULTY_ACCOUNT_CONTRACT_PATH: &str =
-    "./feature_contracts/compiled/account_faulty_compiled.json";
-pub const ERC20_CONTRACT_PATH: &str =
-    "./ERC20_without_some_syscalls/ERC20/erc20_contract_without_some_syscalls_compiled.json";
+pub const ACCOUNT_CONTRACT_PATH: &'static [u8] =
+    include_bytes!("../feature_contracts/compiled/account_without_validations_compiled.json");
+pub const TEST_CONTRACT_PATH: &'static [u8] =
+    include_bytes!("../feature_contracts/compiled/test_contract_compiled.json");
+pub const SECURITY_TEST_CONTRACT_PATH: &'static [u8] =
+    include_bytes!("../feature_contracts/compiled/security_tests_contract_compiled.json");
+pub const TEST_EMPTY_CONTRACT_PATH: &'static [u8] =
+    include_bytes!("../feature_contracts/compiled/empty_contract_compiled.json");
+pub const TEST_FAULTY_ACCOUNT_CONTRACT_PATH: &'static [u8] =
+    include_bytes!("../feature_contracts/compiled/account_faulty_compiled.json");
+pub const ERC20_CONTRACT_PATH: &'static [u8] = include_bytes!(
+    "../ERC20_without_some_syscalls/ERC20/erc20_contract_without_some_syscalls_compiled.json"
+);
 
 // Storage keys.
 pub fn test_erc20_sequencer_balance_key() -> StorageKey {
@@ -127,16 +128,12 @@ pub fn pad_address_to_64(address: &str) -> String {
     String::from("0x") + format!("{:0>64}", trimmed_address).as_str()
 }
 
-pub fn get_contract_class(contract_path: &str) -> ContractClass {
-    let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), contract_path].iter().collect();
-    let raw_contract_class = fs::read_to_string(path).unwrap();
-    serde_json::from_str(&raw_contract_class).unwrap()
+pub fn get_contract_class(contract_content: &'static [u8]) -> ContractClass {
+    serde_json::from_slice(&contract_content).unwrap()
 }
 
-pub fn get_deprecated_contract_class(contract_path: &str) -> DeprecatedContractClass {
-    let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), contract_path].iter().collect();
-    let contract = fs::read_to_string(path).unwrap();
-    let mut raw_contract_class: serde_json::Value = serde_json::from_str(&contract).unwrap();
+pub fn get_deprecated_contract_class(contract: &'static [u8]) -> DeprecatedContractClass {
+    let mut raw_contract_class: serde_json::Value = serde_json::from_slice(&contract).unwrap();
 
     // ABI is not required for execution.
     raw_contract_class

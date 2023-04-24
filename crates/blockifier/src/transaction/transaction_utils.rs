@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use crate::abi::constants;
+use crate::collections::HashMap;
 use crate::execution::entry_point::{CallInfo, ExecutionResources};
 use crate::fee::gas_usage::calculate_tx_gas_usage;
 use crate::fee::os_usage::get_additional_os_resources;

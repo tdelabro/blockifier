@@ -1,12 +1,12 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use alloc::string::ToString;
+use alloc::sync::Arc;
 
 use assert_matches::assert_matches;
 use cairo_vm::vm::runners::builtin_runner::{HASH_BUILTIN_NAME, RANGE_CHECK_BUILTIN_NAME};
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources as VmExecutionResources;
 use itertools::concat;
 use pretty_assertions::assert_eq;
-use starknet_api::core::{ClassHash, ContractAddress, Nonce, PatriciaKey};
+use starknet_api::api_core::{ClassHash, ContractAddress, Nonce, PatriciaKey};
 use starknet_api::deprecated_contract_class::EntryPointType;
 use starknet_api::hash::{StarkFelt, StarkHash};
 use starknet_api::state::StorageKey;
@@ -19,6 +19,7 @@ use starknet_api::{calldata, patricia_key, stark_felt};
 use crate::abi::abi_utils::{get_storage_var_address, selector_from_name};
 use crate::abi::constants as abi_constants;
 use crate::block_context::BlockContext;
+use crate::collections::HashMap;
 use crate::execution::entry_point::{
     CallEntryPoint, CallExecution, CallInfo, CallType, OrderedEvent, Retdata,
 };
@@ -51,7 +52,7 @@ pub const CALL_CONTRACT: u64 = 2;
 fn create_account_tx_test_state(
     account_class_hash: &str,
     account_address: &str,
-    account_path: &str,
+    account_content: &'static [u8],
     erc20_account_balance_key: StorageKey,
     initial_account_balance: u64,
 ) -> CachedState<DictStateReader> {
@@ -61,7 +62,7 @@ fn create_account_tx_test_state(
     let test_account_class_hash = ClassHash(stark_felt!(account_class_hash));
     let test_erc20_class_hash = ClassHash(stark_felt!(TEST_ERC20_CONTRACT_CLASS_HASH));
     let class_hash_to_class = HashMap::from([
-        (test_account_class_hash, get_contract_class(account_path)),
+        (test_account_class_hash, get_contract_class(account_content)),
         (test_contract_class_hash, get_contract_class(TEST_CONTRACT_PATH)),
         (test_erc20_class_hash, get_contract_class(ERC20_CONTRACT_PATH)),
     ]);

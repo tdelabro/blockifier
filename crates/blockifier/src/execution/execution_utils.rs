@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use cairo_felt::Felt252;
 use cairo_vm::serde::deserialize_program::{
@@ -13,12 +14,13 @@ use cairo_vm::vm::runners::cairo_runner::{
     CairoArg, CairoRunner, ExecutionResources as VmExecutionResources,
 };
 use cairo_vm::vm::vm_core::VirtualMachine;
-use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector};
+use starknet_api::api_core::{ClassHash, ContractAddress, EntryPointSelector};
 use starknet_api::deprecated_contract_class::{EntryPointType, Program as DeprecatedProgram};
 use starknet_api::hash::StarkFelt;
 use starknet_api::transaction::Calldata;
 
 use crate::block_context::BlockContext;
+use crate::collections::HashMap;
 use crate::execution::entry_point::{
     execute_constructor_entry_point, CallEntryPoint, CallExecution, CallInfo, CallType,
     EntryPointExecutionResult, ExecutionContext, ExecutionResources, Retdata,
